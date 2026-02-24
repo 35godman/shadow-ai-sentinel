@@ -1,0 +1,383 @@
+package scanner
+
+import (
+	"math"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// ============================================================
+// DETECTION TYPES
+// ============================================================
+
+type Detection struct {
+	ID               string  `json:"id"`
+	EntityType       string  `json:"entityType"`
+	Confidence       float64 `json:"confidence"`
+	Source           string  `json:"source"` // "REGEX" or "ML" or "COMBINED"
+	MatchedText      string  `json:"matchedText"`
+	RedactedText     string  `json:"redactedText"`
+	ContextRiskScore string  `json:"contextRiskScore"` // LOW, MEDIUM, HIGH, CRITICAL
+	StartOffset      int     `json:"startOffset"`
+	EndOffset        int     `json:"endOffset"`
+	PatternID        string  `json:"patternId,omitempty"`
+}
+
+type ScanResult struct {
+	Detections      []Detection `json:"detections"`
+	CombinedRisk    string      `json:"combinedRiskScore"`
+	RecommendedAction string   `json:"recommendedAction"`
+	ScanDurationMs  float64     `json:"scanDurationMs"`
+	RegexDurationMs float64     `json:"regexDurationMs"`
+	MlDurationMs    *float64    `json:"mlDurationMs,omitempty"`
+}
+
+// ============================================================
+// PATTERN DEFINITIONS
+// ============================================================
+
+type Pattern struct {
+	ID                   string
+	EntityType           string
+	Name                 string
+	Regex                *regexp.Regexp
+	Validator            func(match string) bool
+	SensitivityLevel     string
+	ComplianceFrameworks []string
+}
+
+var Patterns = []Pattern{
+	// --- SSN ---
+	{
+		ID: "ssn-dashed", EntityType: "SSN", Name: "US SSN (Dashed)",
+		Regex: regexp.MustCompile(`\b(\d{3}-\d{2}-\d{4})\b`),
+		Validator: validateSSN,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"HIPAA", "SOC2", "CCPA"},
+	},
+
+	// --- Credit Cards ---
+	{
+		ID: "cc-visa", EntityType: "CREDIT_CARD", Name: "Visa",
+		Regex: regexp.MustCompile(`\b(4\d{3}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4})\b`),
+		Validator: luhnCheck,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"PCI-DSS"},
+	},
+	{
+		ID: "cc-mastercard", EntityType: "CREDIT_CARD", Name: "Mastercard",
+		Regex: regexp.MustCompile(`\b(5[1-5]\d{2}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4})\b`),
+		Validator: luhnCheck,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"PCI-DSS"},
+	},
+	{
+		ID: "cc-amex", EntityType: "CREDIT_CARD", Name: "Amex",
+		Regex: regexp.MustCompile(`\b(3[47]\d{2}[\s-]?\d{6}[\s-]?\d{5})\b`),
+		Validator: luhnCheck,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"PCI-DSS"},
+	},
+
+	// --- API Keys ---
+	{
+		ID: "openai-key", EntityType: "API_KEY", Name: "OpenAI Key",
+		Regex: regexp.MustCompile(`\b(sk-[a-zA-Z0-9_-]{20,})\b`),
+		Validator: highEntropy,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2"},
+	},
+	{
+		ID: "anthropic-key", EntityType: "API_KEY", Name: "Anthropic Key",
+		Regex: regexp.MustCompile(`\b(sk-ant-[a-zA-Z0-9_-]{20,})\b`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2"},
+	},
+	{
+		ID: "github-token", EntityType: "API_KEY", Name: "GitHub PAT",
+		Regex: regexp.MustCompile(`\b(ghp_[a-zA-Z0-9]{36,})\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"SOC2"},
+	},
+	{
+		ID: "slack-token", EntityType: "API_KEY", Name: "Slack Token",
+		Regex: regexp.MustCompile(`\b(xox[bprs]-[a-zA-Z0-9-]{10,})\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"SOC2"},
+	},
+	{
+		ID: "stripe-key", EntityType: "API_KEY", Name: "Stripe Key",
+		Regex: regexp.MustCompile(`\b([rs]k_(?:live|test)_[a-zA-Z0-9]{20,})\b`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"PCI-DSS", "SOC2"},
+	},
+
+	// --- Cloud Keys ---
+	{
+		ID: "aws-access-key", EntityType: "AWS_KEY", Name: "AWS Access Key",
+		Regex: regexp.MustCompile(`\b(AKIA[0-9A-Z]{16})\b`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
+	},
+	{
+		ID: "gcp-service-key", EntityType: "GCP_KEY", Name: "GCP Service Key",
+		Regex: regexp.MustCompile(`"private_key":\s*"-----BEGIN (?:RSA )?PRIVATE KEY-----`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
+	},
+
+	// --- PII ---
+	{
+		ID: "email", EntityType: "EMAIL", Name: "Email",
+		Regex: regexp.MustCompile(`\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b`),
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"GDPR", "CCPA"},
+	},
+	{
+		ID: "phone-us", EntityType: "PHONE", Name: "US Phone",
+		Regex:     regexp.MustCompile(`\b(\+?1?[\s.\-]?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4})\b`),
+		Validator: validatePhone,
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"GDPR", "CCPA"},
+	},
+	{
+		ID: "ipv4-private", EntityType: "IP_ADDRESS", Name: "Private IP",
+		Regex: regexp.MustCompile(`\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b`),
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"SOC2"},
+	},
+
+	// --- Medical ---
+	{
+		ID: "npi", EntityType: "MEDICAL_ID", Name: "NPI",
+		Regex: regexp.MustCompile(`(?i)\b(NPI[:\s#]*\d{10})\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"HIPAA"},
+	},
+	{
+		ID: "icd10", EntityType: "DIAGNOSIS", Name: "ICD-10",
+		Regex: regexp.MustCompile(`\b([A-TV-Z]\d{2}(?:\.\d{1,4})?)\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"HIPAA"},
+	},
+
+	// --- Financial ---
+	{
+		ID: "iban", EntityType: "IBAN", Name: "IBAN",
+		Regex: regexp.MustCompile(`\b([A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?(?:[A-Z0-9]{4}[\s]?){1,7}[A-Z0-9]{1,4})\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"PCI-DSS", "GDPR"},
+	},
+
+	// --- Secrets ---
+	{
+		ID: "connection-string", EntityType: "CREDENTIALS", Name: "DB Connection String",
+		Regex: regexp.MustCompile(`((?:mongodb|postgres|mysql|redis|amqp):\/\/[^\s'"]+)`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2"},
+	},
+	{
+		ID: "private-key", EntityType: "CREDENTIALS", Name: "Private Key",
+		Regex: regexp.MustCompile(`(-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
+	},
+
+	// --- Source Code ---
+	{
+		ID: "code-function-py", EntityType: "SOURCE_CODE", Name: "Python Function",
+		Regex: regexp.MustCompile(`\b(def\s+[a-zA-Z_]\w*\s*\([^)]*\)\s*(?:->[\s\w\[\],]*)?:)`),
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"IP"},
+	},
+	{
+		ID: "code-function-js", EntityType: "SOURCE_CODE", Name: "JS/TS Function",
+		Regex: regexp.MustCompile(`\b((?:export\s+)?(?:async\s+)?function\s+[a-zA-Z_]\w*\s*\([^)]*\))`),
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"IP"},
+	},
+}
+
+// ============================================================
+// SCAN ENGINE
+// ============================================================
+
+func ScanText(text string, enabledTypes []string) ScanResult {
+	start := time.Now()
+
+	enabledSet := make(map[string]bool)
+	for _, t := range enabledTypes {
+		enabledSet[t] = true
+	}
+
+	seen := make(map[string]bool) // dedup by offset range
+	var detections []Detection
+
+	for _, p := range Patterns {
+		if len(enabledTypes) > 0 && !enabledSet[p.EntityType] {
+			continue
+		}
+
+		matches := p.Regex.FindAllStringSubmatchIndex(text, -1)
+		for _, loc := range matches {
+			// loc[0], loc[1] = full match; loc[2], loc[3] = capture group 1
+			startOff, endOff := loc[0], loc[1]
+			matchText := text[startOff:endOff]
+
+			// Use capture group if available
+			if len(loc) >= 4 && loc[2] >= 0 {
+				matchText = text[loc[2]:loc[3]]
+			}
+
+			// Run validator
+			if p.Validator != nil && !p.Validator(matchText) {
+				continue
+			}
+
+			// Dedup
+			key := strings.Join([]string{string(rune(startOff)), string(rune(endOff))}, "-")
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			detections = append(detections, Detection{
+				ID:               p.ID + "-" + string(rune(startOff)),
+				EntityType:       p.EntityType,
+				Confidence:       0.95,
+				Source:           "REGEX",
+				MatchedText:      matchText,
+				RedactedText:     "[" + p.EntityType + "_REDACTED]",
+				ContextRiskScore: p.SensitivityLevel,
+				StartOffset:      startOff,
+				EndOffset:        endOff,
+				PatternID:        p.ID,
+			})
+		}
+	}
+
+	elapsed := time.Since(start).Seconds() * 1000
+
+	combinedRisk := determineCombinedRisk(detections)
+	action := determineAction(combinedRisk)
+
+	return ScanResult{
+		Detections:        detections,
+		CombinedRisk:      combinedRisk,
+		RecommendedAction: action,
+		ScanDurationMs:    elapsed,
+		RegexDurationMs:   elapsed,
+	}
+}
+
+// ============================================================
+// VALIDATORS
+// ============================================================
+
+func luhnCheck(num string) bool {
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, num)
+
+	if len(digits) < 13 || len(digits) > 19 {
+		return false
+	}
+
+	sum := 0
+	alt := false
+	for i := len(digits) - 1; i >= 0; i-- {
+		n := int(digits[i] - '0')
+		if alt {
+			n *= 2
+			if n > 9 {
+				n -= 9
+			}
+		}
+		sum += n
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+func validateSSN(ssn string) bool {
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, ssn)
+
+	if len(digits) != 9 {
+		return false
+	}
+
+	area := int(digits[0]-'0')*100 + int(digits[1]-'0')*10 + int(digits[2]-'0')
+	group := int(digits[3]-'0')*10 + int(digits[4]-'0')
+	serial := int(digits[5]-'0')*1000 + int(digits[6]-'0')*100 + int(digits[7]-'0')*10 + int(digits[8]-'0')
+
+	if area == 0 || area == 666 || area >= 900 {
+		return false
+	}
+	if group == 0 || serial == 0 {
+		return false
+	}
+	if digits == "123456789" || digits == "000000000" {
+		return false
+	}
+	return true
+}
+
+func shannonEntropy(s string) float64 {
+	freq := make(map[rune]int)
+	for _, r := range s {
+		freq[r]++
+	}
+	entropy := 0.0
+	l := float64(len(s))
+	for _, count := range freq {
+		p := float64(count) / l
+		entropy -= p * math.Log2(p)
+	}
+	return entropy
+}
+
+func highEntropy(match string) bool {
+	// Strip known prefixes
+	clean := match
+	for _, prefix := range []string{"sk-", "AKIA", "ghp_", "xoxb-", "xoxp-", "sk-ant-"} {
+		clean = strings.TrimPrefix(clean, prefix)
+	}
+	return shannonEntropy(clean) > 3.5 && len(clean) >= 16
+}
+
+func validatePhone(phone string) bool {
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phone)
+	return len(digits) >= 10 && len(digits) <= 11
+}
+
+// ============================================================
+// RISK SCORING
+// ============================================================
+
+func determineCombinedRisk(detections []Detection) string {
+	if len(detections) == 0 {
+		return "LOW"
+	}
+	for _, d := range detections {
+		if d.ContextRiskScore == "CRITICAL" {
+			return "CRITICAL"
+		}
+	}
+	for _, d := range detections {
+		if d.ContextRiskScore == "HIGH" {
+			return "HIGH"
+		}
+	}
+	for _, d := range detections {
+		if d.ContextRiskScore == "MEDIUM" {
+			return "MEDIUM"
+		}
+	}
+	return "LOW"
+}
+
+func determineAction(risk string) string {
+	switch risk {
+	case "CRITICAL":
+		return "BLOCK"
+	case "HIGH":
+		return "REDACT"
+	case "MEDIUM":
+		return "WARN"
+	default:
+		return "LOG"
+	}
+}

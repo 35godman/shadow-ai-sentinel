@@ -1,0 +1,102 @@
+version: "3.9"
+
+# ============================================================
+# Shadow AI Sentinel — Local Development / On-Prem Base Stack
+# Usage: docker compose -f infra/docker-compose.yml up -d
+# ============================================================
+
+services:
+  # --- Primary Database ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel-dev-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Session Cache + Rate Limiting ---
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-sentinel-dev-redis}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-sentinel-dev-redis}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- ML Classifier Service (Python) ---
+  # Phase 2: Uncomment when ml-service is built
+  # ml-service:
+  #   build:
+  #     context: ../apps/ml-service
+  #     dockerfile: Dockerfile
+  #   container_name: sentinel-ml
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8081:8081"
+  #   environment:
+  #     - MODEL_PATH=/models/sentinel-ner.onnx
+  #   volumes:
+  #     - ml-models:/models
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+
+  # --- Proxy Service (Go) ---
+  # Phase 2: Uncomment when proxy-service is built
+  # proxy-service:
+  #   build:
+  #     context: ../apps/proxy-service
+  #     dockerfile: Dockerfile
+  #   container_name: sentinel-proxy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:8080"
+  #   environment:
+  #     - DATABASE_URL=postgres://sentinel:${POSTGRES_PASSWORD:-sentinel-dev-password}@postgres:5432/sentinel
+  #     - REDIS_URL=redis://:${REDIS_PASSWORD:-sentinel-dev-redis}@redis:6379
+  #     - ML_SERVICE_URL=http://ml-service:8081
+  #     - ENVIRONMENT=development
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+
+  # --- Admin Dashboard (React) ---
+  # Phase 3: Uncomment when dashboard is built
+  # dashboard:
+  #   build:
+  #     context: ../apps/dashboard
+  #     dockerfile: Dockerfile
+  #   container_name: sentinel-dashboard
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - VITE_API_URL=http://proxy-service:8080/api/v1
+
+volumes:
+  postgres-data:
+  redis-data:
+  # ml-models:

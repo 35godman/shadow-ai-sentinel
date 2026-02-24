@@ -1,0 +1,40 @@
+node_modules/
+dist/
+.turbo/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+coverage/
+*.tsbuildinfo
+
+# Go
+apps/proxy-service/bin/
+apps/proxy-service/tmp/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+apps/ml-service/models/*.onnx
+apps/ml-service/models/*.bin
+
+# Docker
+.docker/
+
+# IDE
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+
+# Terraform
+infra/terraform/**/*.tfstate
+infra/terraform/**/*.tfstate.backup
+infra/terraform/**/.terraform/
+
+# Secrets - NEVER commit
+*.pem
+*.key
+service-account.json

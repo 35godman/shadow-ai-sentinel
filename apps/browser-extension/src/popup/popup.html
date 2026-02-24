@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shadow AI Sentinel</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-left">
+        <span class="shield-icon">🛡️</span>
+        <h1>AI Sentinel</h1>
+      </div>
+      <div class="status-badge" id="status-badge">
+        <span class="status-dot"></span>
+        <span id="status-text">Active</span>
+      </div>
+    </div>
+
+    <!-- Stats Card -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-number" id="total-scans">0</div>
+        <div class="stat-label">Scans Today</div>
+      </div>
+      <div class="stat-card stat-warning">
+        <div class="stat-number" id="total-warnings">0</div>
+        <div class="stat-label">Warnings</div>
+      </div>
+      <div class="stat-card stat-danger">
+        <div class="stat-number" id="total-blocks">0</div>
+        <div class="stat-label">Blocked</div>
+      </div>
+    </div>
+
+    <!-- Current Page Status -->
+    <div class="section" id="current-page-section" style="display:none;">
+      <div class="section-title">Current Page</div>
+      <div class="current-page" id="current-page">
+        <span class="page-icon" id="page-risk-icon">●</span>
+        <div>
+          <div class="page-name" id="page-name">—</div>
+          <div class="page-risk" id="page-risk">Not an AI tool</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Events -->
+    <div class="section">
+      <div class="section-title">Recent Detections</div>
+      <div id="recent-events" class="event-list">
+        <div class="empty-state">No detections yet. Start using AI tools to see activity.</div>
+      </div>
+    </div>
+
+    <!-- Mode Toggle -->
+    <div class="section">
+      <div class="mode-toggle">
+        <div>
+          <div class="mode-label">Learning Mode</div>
+          <div class="mode-desc">Log detections without blocking</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="learning-mode-toggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Settings Link -->
+    <div class="footer">
+      <div class="connection-status" id="connection-status">
+        <span class="conn-dot conn-disconnected"></span>
+        Not connected to proxy
+      </div>
+      <a href="#" id="settings-link" class="settings-link">Settings</a>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

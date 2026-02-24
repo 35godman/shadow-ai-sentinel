@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "Shadow AI Sentinel",
+  "description": "Protect your organization from AI data leakage. Detects and blocks sensitive data (PII, secrets, source code) before it reaches AI tools.",
+  "version": "0.1.0",
+
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "declarativeNetRequest",
+    "alarms",
+    "notifications"
+  ],
+
+  "optional_permissions": [
+    "webRequest"
+  ],
+
+  "host_permissions": [
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*",
+    "https://perplexity.ai/*",
+    "https://chat.deepseek.com/*",
+    "https://poe.com/*",
+    "https://you.com/*",
+    "https://character.ai/*",
+    "https://grok.x.ai/*",
+    "https://chat.mistral.ai/*",
+    "https://*.huggingface.co/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*",
+        "https://perplexity.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://poe.com/*",
+        "https://you.com/*",
+        "https://character.ai/*",
+        "https://grok.x.ai/*",
+        "https://chat.mistral.ai/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

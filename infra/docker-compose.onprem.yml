@@ -1,0 +1,124 @@
+version: "3.9"
+
+# ============================================================
+# Shadow AI Sentinel — On-Premises Air-Gapped Deployment
+# Includes: ALL services + Ollama for local LLM
+# Usage: docker compose -f infra/docker-compose.onprem.yml up -d
+#
+# ZERO EXTERNAL NETWORK CALLS
+# All data stays within the customer's infrastructure
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - sentinel-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Local LLM via Ollama ---
+  # GPU: Set OLLAMA_GPU=nvidia in .env and uncomment deploy section
+  # CPU: Works out of the box with quantized models (slower)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sentinel-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - sentinel-net
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    # Uncomment for GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Phase 2: ML Classifier
+  # ml-service:
+  #   build: ../apps/ml-service
+  #   container_name: sentinel-ml
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8081:8081"
+  #   networks:
+  #     - sentinel-net
+
+  # Phase 2: Proxy Service
+  # proxy-service:
+  #   build: ../apps/proxy-service
+  #   container_name: sentinel-proxy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:8080"
+  #   environment:
+  #     - DATABASE_URL=postgres://sentinel:${POSTGRES_PASSWORD}@postgres:5432/sentinel
+  #     - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+  #     - ML_SERVICE_URL=http://ml-service:8081
+  #     - OLLAMA_URL=http://ollama:11434
+  #     - ONPREM_MODE=true
+  #     - ENVIRONMENT=production
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+  #     redis: { condition: service_healthy }
+  #     ollama: { condition: service_started }
+  #   networks:
+  #     - sentinel-net
+
+  # Phase 3: Dashboard
+  # dashboard:
+  #   build: ../apps/dashboard
+  #   container_name: sentinel-dashboard
+  #   ports:
+  #     - "3000:3000"
+  #   networks:
+  #     - sentinel-net
+
+volumes:
+  postgres-data:
+  redis-data:
+  ollama-data:
+
+networks:
+  sentinel-net:
+    driver: bridge
+    # For true air-gap, no external connectivity:
+    internal: false  # Set to true to prevent any external network access
