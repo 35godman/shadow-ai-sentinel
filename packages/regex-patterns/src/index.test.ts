@@ -121,7 +121,7 @@ describe("API Key Detection", () => {
   });
 
   it("detects Stripe keys", () => {
-    const result = scanText("sk_live_abcdefghijklmnopqrstuvwxyz");
+    const result = scanText("sk_live_FAKEKEYFORTESTINGONLY1234567");
     expect(result.detections.some(d => d.entityType === "API_KEY")).toBe(true);
   });
 });
