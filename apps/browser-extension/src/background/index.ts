@@ -1,5 +1,5 @@
 import { matchDomain, isAiApiEndpoint } from "@sentinel/ai-domain-registry";
-import { scanText } from "@sentinel/regex-patterns";
+import { scanText, redactText } from "@sentinel/regex-patterns";
 import type {
   ExtensionConfig, AuditEvent, ShadowAiEvent, SensitivityLevel, PolicyAction, Detection
 } from "@sentinel/shared-types";
@@ -14,7 +14,7 @@ let config: ExtensionConfig = {
   proxyEndpoint: "http://localhost:8080", // Default to local Docker proxy
   pollingIntervalMs: 60000,
   enabledDetectors: [],
-  learningMode: true, // Start in learning mode by default
+  learningMode: false, // Enforce by default — learning mode is opt-in via proxy config
   aiDomainRegistryVersion: "1.0.0",
   regexPatternsVersion: "1.0.0",
 };
@@ -50,6 +50,17 @@ async function loadConfig() {
 
 async function saveConfig() {
   await chrome.storage.local.set({ sentinel_config: config });
+  // Broadcast updated config to all content scripts so they apply it immediately
+  // without waiting for the next page load.
+  chrome.tabs.query({}, (tabs) => {
+    for (const tab of tabs) {
+      if (tab.id) {
+        chrome.tabs.sendMessage(tab.id, { type: "CONFIG_UPDATE", config }).catch(() => {
+          // Tab may not have a content script — ignore silently
+        });
+      }
+    }
+  });
 }
 
 // ============================================================
@@ -189,6 +200,10 @@ async function handleScanRequest(
       endOffset: d.endOffset,
     })),
     userMessage,
+    // Include redacted content so the content script can insert it instead of original
+    redactedContent: action === "REDACT" && scanResult.detections.length > 0
+      ? redactText(content, scanResult.detections)
+      : undefined,
   };
 }
 
@@ -202,7 +217,9 @@ async function sendToProxy(
   targetUrl: string,
   contentType: string
 ): Promise<{ action: PolicyAction; detections: Partial<Detection>[]; userMessage?: string; redactedContent?: string } | null> {
-  if (!config.proxyEndpoint || !config.apiKey) return null;
+  // Only require proxyEndpoint — apiKey is optional (proxy allows unauthenticated
+  // requests in dev mode when API_KEY env is not set).
+  if (!config.proxyEndpoint) return null;
 
   const response = await fetch(`${config.proxyEndpoint}/api/v1/scan`, {
     method: "POST",
