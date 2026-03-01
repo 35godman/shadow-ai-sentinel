@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -364,6 +363,3 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
-
-// Suppress unused import warnings
-var _ = strconv.Atoi
