@@ -10,6 +10,7 @@ module.exports = {
   output: {
     path: path.resolve(__dirname, "dist"),
     filename: "[name].js",
+    clean: true,
   },
   module: {
     rules: [
@@ -24,12 +25,14 @@ module.exports = {
     extensions: [".ts", ".js"],
   },
   plugins: [
-    new CopyPlugin([
-      { from: "manifest.json", to: "manifest.json" },
-      { from: "src/popup/popup.html", to: "popup.html" },
-      { from: "src/popup/popup.css", to: "popup.css" },
-      // Icons will be added later
-    ]),
+    new CopyPlugin({
+      patterns: [
+        { from: "manifest.json", to: "manifest.json" },
+        { from: "src/popup/popup.html", to: "popup.html" },
+        { from: "src/popup/popup.css", to: "popup.css" },
+        // Icons will be added later
+      ],
+    }),
   ],
   optimization: {
     minimize: true,
