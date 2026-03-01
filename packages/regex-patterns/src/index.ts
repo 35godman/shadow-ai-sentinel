@@ -255,26 +255,13 @@ export const PATTERNS: RegexPattern[] = [
     id: "phone-intl",
     entityType: "PHONE",
     name: "International Phone",
-    pattern: /\b(\+[1-9]\d{1,2}[\s.-]?\d{2,4}[\s.-]?\d{3,4}[\s.-]?\d{3,4})\b/g,
+    pattern: /(\+[1-9]\d{1,2}[\s.-]?\d{2,4}[\s.-]?\d{3,4}[\s.-]?\d{3,4})/g,
     sensitivityLevel: "MEDIUM",
     complianceFrameworks: ["GDPR", "CCPA"],
     description: "International phone with country code",
   },
 
   // --- IP Addresses ---
-  {
-    id: "ipv4",
-    entityType: "IP_ADDRESS",
-    name: "IPv4 Address",
-    pattern: /\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g,
-    validator: (m) => {
-      const parts = m.split(".").map(Number);
-      return parts.every((p) => p >= 0 && p <= 255);
-    },
-    sensitivityLevel: "LOW",
-    complianceFrameworks: ["SOC2"],
-    description: "IPv4 address",
-  },
   {
     id: "ipv4-private",
     entityType: "IP_ADDRESS",
