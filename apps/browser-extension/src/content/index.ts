@@ -9,14 +9,23 @@ import type { PolicyAction, Detection } from "@sentinel/shared-types";
 
 // --- State ---
 let isEnabled = true;
-let learningMode = true;
+let learningMode = false; // Enforce by default — matches proxy and background defaults
 let lastScanResult: { action: PolicyAction; detections: Partial<Detection>[] } | null = null;
 
-// --- Load config from background ---
+// --- Load config from background on init ---
 chrome.runtime.sendMessage({ type: "GET_CONFIG" }, (config) => {
   if (config) {
     isEnabled = true;
-    learningMode = config.learningMode ?? true;
+    learningMode = config.learningMode ?? false;
+  }
+});
+
+// --- Listen for live config updates pushed from background ---
+// Background calls saveConfig() → broadcasts CONFIG_UPDATE to all content scripts.
+// This lets learning mode toggles take effect immediately without page reload.
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "CONFIG_UPDATE" && message.config) {
+    learningMode = message.config.learningMode ?? false;
   }
 });
 
