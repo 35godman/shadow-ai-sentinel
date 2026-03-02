@@ -675,7 +675,7 @@ func TestMergeMLDetections_SkipsOverlapping(t *testing.T) {
 		RecommendedAction: "BLOCK",
 	}
 
-	// ML also detects at the same offset — should be skipped.
+	// ML also detects at the same offset but with LOWER confidence — should be dropped.
 	mlDets := []map[string]interface{}{
 		{
 			"entity_type":        "SSN",
@@ -691,6 +691,117 @@ func TestMergeMLDetections_SkipsOverlapping(t *testing.T) {
 	merged := scanner.MergeMLDetections(base, mlDets)
 
 	if len(merged.Detections) != 1 {
-		t.Errorf("expected 1 detection (overlapping ML skipped), got %d", len(merged.Detections))
+		t.Errorf("expected 1 detection (overlapping lower-conf ML dropped), got %d", len(merged.Detections))
+	}
+	// The REGEX detection should have been kept (higher confidence).
+	if merged.Detections[0].Source != "REGEX" {
+		t.Errorf("expected REGEX source to be kept, got %s", merged.Detections[0].Source)
+	}
+}
+
+func TestMergeMLDetections_HigherConfidenceMLReplacesRegex(t *testing.T) {
+	// Regex detected PERSON at offset 0-8 with confidence 0.95.
+	base := scanner.ScanResult{
+		Detections: []scanner.Detection{
+			{
+				ID:               "regex-person-0",
+				EntityType:       "PERSON",
+				Source:           "REGEX",
+				StartOffset:      0,
+				EndOffset:        8,
+				ContextRiskScore: "MEDIUM",
+				Confidence:       0.80,
+				MatchedText:      "John Doe",
+				RedactedText:     "[PERSON_REDACTED]",
+			},
+		},
+		CombinedRisk:      "MEDIUM",
+		RecommendedAction: "WARN",
+	}
+
+	// ML detects at the same span but with HIGHER confidence — should REPLACE the regex detection.
+	mlDets := []map[string]interface{}{
+		{
+			"entity_type":        "PERSON",
+			"text":               "John Doe",
+			"start":              float64(0),
+			"end":                float64(8),
+			"confidence":         float64(0.97),
+			"context_risk_score": "MEDIUM",
+			"redacted_text":      "[PERSON_REDACTED]",
+		},
+	}
+
+	merged := scanner.MergeMLDetections(base, mlDets)
+
+	if len(merged.Detections) != 1 {
+		t.Errorf("expected 1 detection after confidence-based replacement, got %d", len(merged.Detections))
+	}
+	// The ML detection should have replaced the regex one.
+	if merged.Detections[0].Source != "ML" {
+		t.Errorf("expected ML source after replacement, got %s", merged.Detections[0].Source)
+	}
+	if merged.Detections[0].Confidence != 0.97 {
+		t.Errorf("expected confidence 0.97, got %f", merged.Detections[0].Confidence)
+	}
+}
+
+func TestMergeMLDetections_InvalidRiskScore_DefaultsToLow(t *testing.T) {
+	base := scanner.ScanResult{
+		Detections:        []scanner.Detection{},
+		CombinedRisk:      "LOW",
+		RecommendedAction: "LOG",
+	}
+
+	// ML returns an invalid risk score — should default to LOW (fail-safe).
+	mlDets := []map[string]interface{}{
+		{
+			"entity_type":        "PERSON",
+			"text":               "Alice",
+			"start":              float64(0),
+			"end":                float64(5),
+			"confidence":         float64(0.85),
+			"context_risk_score": "UNKNOWN_LEVEL",
+			"redacted_text":      "[PERSON_REDACTED]",
+		},
+	}
+
+	merged := scanner.MergeMLDetections(base, mlDets)
+
+	if len(merged.Detections) != 1 {
+		t.Fatalf("expected 1 detection, got %d", len(merged.Detections))
+	}
+	if merged.Detections[0].ContextRiskScore != "LOW" {
+		t.Errorf("invalid risk score should default to LOW, got %q", merged.Detections[0].ContextRiskScore)
+	}
+}
+
+func TestMergeMLDetections_EmptyRiskScore_DefaultsToLow(t *testing.T) {
+	base := scanner.ScanResult{
+		Detections:        []scanner.Detection{},
+		CombinedRisk:      "LOW",
+		RecommendedAction: "LOG",
+	}
+
+	// ML returns empty risk score — should default to LOW (fail-safe).
+	mlDets := []map[string]interface{}{
+		{
+			"entity_type":        "EMAIL",
+			"text":               "bob@example.com",
+			"start":              float64(0),
+			"end":                float64(15),
+			"confidence":         float64(0.9),
+			"context_risk_score": "",
+			"redacted_text":      "[EMAIL_REDACTED]",
+		},
+	}
+
+	merged := scanner.MergeMLDetections(base, mlDets)
+
+	if len(merged.Detections) != 1 {
+		t.Fatalf("expected 1 detection, got %d", len(merged.Detections))
+	}
+	if merged.Detections[0].ContextRiskScore != "LOW" {
+		t.Errorf("empty risk score should default to LOW, got %q", merged.Detections[0].ContextRiskScore)
 	}
 }

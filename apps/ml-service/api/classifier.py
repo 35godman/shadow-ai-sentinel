@@ -148,6 +148,10 @@ class Classifier:
             if not self._overlaps(sd, detections):
                 detections.append(sd)
 
+        # Cleanup: remove any remaining overlaps that _overlaps() may have left
+        # when a replacement caused a second overlap with another existing detection.
+        detections = self._remove_dominated_overlaps(detections)
+
         # Layer 3: Context scoring
         detections = self._apply_context_scoring(text, detections)
 
@@ -231,26 +235,23 @@ class Classifier:
         A phone number in a support article = LOW.
         Same phone number preceded by 'patient' = HIGH.
 
-        Context check is PER ENTITY (±150 chars around each detection) — not a global
-        document-level flag. This prevents a single 'patient' mention from elevating
-        ALL entities in the document, including unrelated emails and phone numbers.
+        All context checks are PER ENTITY (±150 chars around each detection) — not
+        global document-level flags. This prevents a single keyword anywhere in the
+        document from elevating ALL entities, including unrelated ones far away.
         """
         text_lower = text.lower()
-        # Financial and code context are document-level (they affect all entities)
-        has_financial_context = any(kw in text_lower for kw in FINANCIAL_CONTEXT)
+        # Code context is document-level: code files are a different class of content
+        # and the de-escalation applies uniformly across the file.
         has_code_context = any(kw in text_lower for kw in CODE_CONTEXT)
 
         for d in detections:
-            # Per-entity context window: 150 chars around this specific detection
+            # Per-entity context window: ±150 chars around this specific detection
             ctx_start = max(0, d.start - 150)
             ctx_end = min(len(text), d.end + 150)
             context_window = text[ctx_start:ctx_end].lower()
 
-            # Medical context check is PER ENTITY — only elevates entities
-            # that actually appear near medical keywords.
+            # Medical context: per entity — only elevates entities near medical keywords.
             has_medical_context = any(kw in context_window for kw in MEDICAL_CONTEXT)
-
-            # Medical context elevates PII near medical keywords
             if has_medical_context:
                 if d.entity_type in ("PERSON", "PHONE", "EMAIL", "LOCATION"):
                     d.context_risk_score = SensitivityLevel.HIGH
@@ -258,7 +259,8 @@ class Classifier:
                 if d.entity_type == "PERSON" and any(kw in context_window for kw in ("patient", "diagnosis", "treatment")):
                     d.context_risk_score = SensitivityLevel.CRITICAL
 
-            # Financial context
+            # Financial context: per entity — only elevates entities near financial keywords.
+            has_financial_context = any(kw in context_window for kw in FINANCIAL_CONTEXT)
             if has_financial_context:
                 if d.entity_type in ("PERSON", "PHONE", "EMAIL"):
                     d.context_risk_score = SensitivityLevel.HIGH
@@ -317,6 +319,30 @@ class Classifier:
                     existing[i] = detection
                 return True
         return False
+
+    def _remove_dominated_overlaps(self, detections: list[MLDetection]) -> list[MLDetection]:
+        """
+        Remove detections that are dominated by a higher-confidence overlapping detection.
+
+        This is a cleanup pass run after all detections are merged. It handles edge
+        cases where _overlaps() may have left multiple overlapping detections in the
+        list (e.g. a new detection replaced existing[0], but existing[1] also overlaps).
+
+        Strategy: process detections in descending confidence order; a detection is
+        kept only if it does not overlap with any already-accepted detection.
+        """
+        sorted_dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
+        result: list[MLDetection] = []
+        for det in sorted_dets:
+            dominated = any(
+                det.start < kept.end and det.end > kept.start
+                for kept in result
+            )
+            if not dominated:
+                result.append(det)
+        # Restore original order (ascending start offset) for consistent output.
+        result.sort(key=lambda d: d.start)
+        return result
 
 
 # Singleton instance

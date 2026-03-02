@@ -139,7 +139,9 @@ async def classify_batch(requests: list[ScanRequest]):
                         "start": d.start,
                         "end": d.end,
                         "confidence": round(d.confidence, 3),
+                        "source": d.source,
                         "context_risk_score": d.context_risk_score.value,
+                        "redacted_text": d.redacted_text,
                     }
                     for d in result.detections
                 ],

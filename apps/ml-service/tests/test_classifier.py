@@ -11,10 +11,16 @@ These tests use unittest.mock to avoid loading heavy spaCy/Presidio models,
 so they run in CI without the full ML dependency stack.
 """
 
+import os
 import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
+
+# Ensure the ml-service root is on sys.path so we can import `api.classifier`
+# regardless of whether tests are run from the project root or the service dir.
+_ML_SERVICE_ROOT = os.path.join(os.path.dirname(__file__), "..")
+if _ML_SERVICE_ROOT not in sys.path:
+    sys.path.insert(0, os.path.abspath(_ML_SERVICE_ROOT))
 
 
 # ============================================================
@@ -30,26 +36,16 @@ def _make_mock_spacy():
     return spacy_mod
 
 
-def _make_mock_presidio():
-    presidio_mod = MagicMock()
-    analyzer_mod = MagicMock()
-    nlp_engine_mod = MagicMock()
-    presidio_mod.AnalyzerEngine = MagicMock()
-    presidio_mod.RecognizerResult = MagicMock()
-    return presidio_mod, analyzer_mod, nlp_engine_mod
-
-
 # Install lightweight mocks before importing classifier
 spacy_mock = _make_mock_spacy()
 sys.modules.setdefault("spacy", spacy_mock)
 
-presidio_mock = MagicMock()
-sys.modules.setdefault("presidio_analyzer", presidio_mock)
+sys.modules.setdefault("presidio_analyzer", MagicMock())
 sys.modules.setdefault("presidio_analyzer.nlp_engine", MagicMock())
 sys.modules.setdefault("structlog", MagicMock())
 
 # Now we can safely import the classifier
-from apps.ml_service.api.classifier import (  # noqa: E402
+from api.classifier import (  # noqa: E402
     Classifier,
     MLDetection,
     SensitivityLevel,
@@ -59,9 +55,9 @@ from apps.ml_service.api.classifier import (  # noqa: E402
 
 def _make_classifier() -> Classifier:
     """Build a Classifier with mocked heavy dependencies."""
-    with patch("apps.ml_service.api.classifier.spacy") as mock_spacy, \
-         patch("apps.ml_service.api.classifier.AnalyzerEngine") as mock_ae, \
-         patch("apps.ml_service.api.classifier.NlpEngineProvider") as mock_nlp:
+    with patch("api.classifier.spacy") as mock_spacy, \
+         patch("api.classifier.AnalyzerEngine") as mock_ae, \
+         patch("api.classifier.NlpEngineProvider") as mock_nlp:
 
         doc_mock = MagicMock()
         doc_mock.ents = []
@@ -105,9 +101,11 @@ class TestMedicalContextIsLocal(unittest.TestCase):
 
         result = clf._apply_context_scoring(text, detections)
 
-        self.assertGreaterEqual(
+        # SensitivityLevel is a str enum — use assertIn rather than assertGreaterEqual
+        # to avoid alphabetical ordering surprises ("CRITICAL" < "HIGH" alphabetically).
+        self.assertIn(
             result[0].context_risk_score,
-            SensitivityLevel.HIGH,
+            {SensitivityLevel.HIGH, SensitivityLevel.CRITICAL},
             "PERSON near 'patient' should be elevated to at least HIGH",
         )
 
@@ -161,9 +159,9 @@ class TestMedicalContextIsLocal(unittest.TestCase):
         john_risk = result[0].context_risk_score
         alice_risk = result[1].context_risk_score
 
-        # John is next to 'patient' — should be elevated
-        self.assertGreaterEqual(john_risk, SensitivityLevel.HIGH,
-                                f"John near 'patient' should be HIGH/CRITICAL, got {john_risk}")
+        # John is next to 'patient' — should be elevated to at least HIGH
+        self.assertIn(john_risk, {SensitivityLevel.HIGH, SensitivityLevel.CRITICAL},
+                      f"John near 'patient' should be HIGH/CRITICAL, got {john_risk}")
 
         # Alice is far away — should NOT be CRITICAL (baseline for PERSON is MEDIUM)
         self.assertNotEqual(alice_risk, SensitivityLevel.CRITICAL,
@@ -230,6 +228,115 @@ class TestOverlapDedupKeepsHigherConfidence(unittest.TestCase):
         self.assertFalse(overlaps, "_overlaps should return False when no overlap")
         # Existing should be unchanged
         self.assertEqual(existing[0].confidence, 0.8)
+
+
+class TestFinancialContextIsLocal(unittest.TestCase):
+    """
+    Financial context scoring must be PER ENTITY (local ±150-char window),
+    not a global document flag. Mirrors the already-correct medical context fix.
+    """
+
+    def _make_clf(self):
+        clf = Classifier.__new__(Classifier)
+        clf.nlp = MagicMock()
+        clf.presidio = MagicMock()
+        return clf
+
+    def test_entity_near_financial_keyword_is_elevated(self):
+        """A PERSON right next to 'payment' should be elevated to HIGH."""
+        clf = self._make_clf()
+
+        text = "payment invoice for Alice Johnson."
+        detections = [
+            MLDetection(entity_type="PERSON", text="Alice Johnson", start=20, end=33, confidence=0.75)
+        ]
+
+        result = clf._apply_context_scoring(text, detections)
+
+        self.assertEqual(
+            result[0].context_risk_score,
+            SensitivityLevel.HIGH,
+            "PERSON near 'payment' should be elevated to HIGH",
+        )
+
+    def test_entity_far_from_financial_keyword_not_elevated(self):
+        """
+        A PERSON 500 chars away from any financial keyword should NOT be elevated.
+        This was the bug: global has_financial_context flag elevated everything.
+        """
+        clf = self._make_clf()
+
+        # Financial keyword at the very end, PERSON at position 0
+        far_away_text = "Alice Johnson is the director." + " " * 400 + " payment invoice #1234"
+        detections = [
+            MLDetection(entity_type="PERSON", text="Alice Johnson", start=0, end=13, confidence=0.75)
+        ]
+
+        result = clf._apply_context_scoring(far_away_text, detections)
+
+        self.assertNotEqual(
+            result[0].context_risk_score,
+            SensitivityLevel.HIGH,
+            "PERSON far from financial keyword should NOT be elevated to HIGH (per-entity window fix)",
+        )
+
+
+class TestRemoveDominatedOverlaps(unittest.TestCase):
+    """
+    _remove_dominated_overlaps() cleans up any residual overlapping detections
+    left after the _overlaps() dedup loop, keeping the highest-confidence one.
+    """
+
+    def _make_clf(self):
+        clf = Classifier.__new__(Classifier)
+        clf.nlp = MagicMock()
+        clf.presidio = MagicMock()
+        return clf
+
+    def test_keeps_highest_confidence_when_overlapping(self):
+        """When two detections overlap, only the higher-confidence one survives."""
+        clf = self._make_clf()
+
+        detections = [
+            MLDetection(entity_type="PERSON", text="John", start=0, end=4, confidence=0.6),
+            MLDetection(entity_type="PERSON", text="John Doe", start=0, end=8, confidence=0.95),
+        ]
+
+        result = clf._remove_dominated_overlaps(detections)
+
+        self.assertEqual(len(result), 1, "Overlapping detections should be reduced to 1")
+        self.assertEqual(result[0].confidence, 0.95,
+                         "Higher-confidence detection should survive")
+        self.assertEqual(result[0].text, "John Doe")
+
+    def test_non_overlapping_detections_all_kept(self):
+        """Non-overlapping detections should all be kept intact."""
+        clf = self._make_clf()
+
+        detections = [
+            MLDetection(entity_type="PERSON", text="John", start=0, end=4, confidence=0.8),
+            MLDetection(entity_type="EMAIL", text="a@b.com", start=10, end=17, confidence=0.9),
+            MLDetection(entity_type="PHONE", text="555-1234", start=25, end=33, confidence=0.85),
+        ]
+
+        result = clf._remove_dominated_overlaps(detections)
+
+        self.assertEqual(len(result), 3, "All non-overlapping detections should be kept")
+
+    def test_output_sorted_by_start_offset(self):
+        """Output detections should be ordered by start offset."""
+        clf = self._make_clf()
+
+        detections = [
+            MLDetection(entity_type="EMAIL", text="a@b.com", start=30, end=37, confidence=0.9),
+            MLDetection(entity_type="PERSON", text="John", start=0, end=4, confidence=0.8),
+            MLDetection(entity_type="PHONE", text="555-1234", start=15, end=23, confidence=0.75),
+        ]
+
+        result = clf._remove_dominated_overlaps(detections)
+
+        offsets = [d.start for d in result]
+        self.assertEqual(offsets, sorted(offsets), "Output should be sorted by start offset")
 
 
 class TestCombinedRisk(unittest.TestCase):

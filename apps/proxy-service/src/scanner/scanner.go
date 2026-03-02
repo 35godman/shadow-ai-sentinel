@@ -425,8 +425,21 @@ func awsSecretValidator(match string) bool {
 // ML DETECTION MERGE
 // ============================================================
 
-// MergeMLDetections adds non-overlapping ML detections into a regex scan result
-// and re-computes combined risk and recommended action.
+// validRiskScores is the set of accepted context_risk_score values from the ML service.
+var validRiskScores = map[string]bool{
+	"LOW": true, "MEDIUM": true, "HIGH": true, "CRITICAL": true,
+}
+
+// MergeMLDetections merges ML detections into a regex scan result using
+// confidence-based overlap resolution and re-computes combined risk.
+//
+// Overlap resolution rules:
+//   - No overlap → append ML detection.
+//   - Overlap and ML confidence > regex confidence → replace regex detection.
+//   - Overlap and ML confidence ≤ regex confidence → keep regex detection, drop ML.
+//
+// Invalid or empty context_risk_score values from the ML service default to "LOW"
+// (fail-safe — unknown risk is treated as low, not promoted to medium).
 func MergeMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanResult {
 	for _, raw := range mlDets {
 		entityType, _ := raw["entity_type"].(string)
@@ -443,26 +456,20 @@ func MergeMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanRes
 		if entityType == "" {
 			continue
 		}
-		if riskScore == "" {
-			riskScore = "MEDIUM"
+
+		// Fail-safe: unknown or empty risk scores default to LOW (not MEDIUM).
+		if !validRiskScores[riskScore] {
+			if riskScore != "" {
+				fmt.Printf("MergeMLDetections: unrecognised context_risk_score %q for %s, defaulting to LOW\n", riskScore, entityType)
+			}
+			riskScore = "LOW"
 		}
+
 		if redactedText == "" {
 			redactedText = "[" + entityType + "_REDACTED]"
 		}
 
-		// Skip if overlapping with any existing regex detection.
-		overlaps := false
-		for _, existing := range base.Detections {
-			if start < existing.EndOffset && end > existing.StartOffset {
-				overlaps = true
-				break
-			}
-		}
-		if overlaps {
-			continue
-		}
-
-		base.Detections = append(base.Detections, Detection{
+		mlDet := Detection{
 			ID:               fmt.Sprintf("ml-%s-%d", entityType, start),
 			EntityType:       entityType,
 			Confidence:       confidence,
@@ -472,10 +479,29 @@ func MergeMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanRes
 			ContextRiskScore: riskScore,
 			StartOffset:      start,
 			EndOffset:        end,
-		})
+		}
+
+		// Confidence-based overlap resolution: find the first overlapping regex detection.
+		overlapIdx := -1
+		for i, existing := range base.Detections {
+			if start < existing.EndOffset && end > existing.StartOffset {
+				overlapIdx = i
+				break
+			}
+		}
+
+		switch {
+		case overlapIdx == -1:
+			// No overlap — append the ML detection.
+			base.Detections = append(base.Detections, mlDet)
+		case confidence > base.Detections[overlapIdx].Confidence:
+			// ML has higher confidence — replace the overlapping regex detection.
+			base.Detections[overlapIdx] = mlDet
+		// else: regex detection has equal or higher confidence — keep it, drop ML.
+		}
 	}
 
-	// Re-compute risk and action after adding ML detections.
+	// Re-compute risk and action after adding/replacing ML detections.
 	base.CombinedRisk = determineCombinedRisk(base.Detections)
 	base.RecommendedAction = determineAction(base.CombinedRisk)
 
