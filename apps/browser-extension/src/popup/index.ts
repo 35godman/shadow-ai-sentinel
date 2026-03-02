@@ -99,7 +99,7 @@ async function checkProxyConnection() {
   const config = await chrome.runtime.sendMessage({ type: "GET_CONFIG" });
   const statusEl = document.getElementById("connection-status")!;
 
-  if (!config?.proxyEndpoint || !config?.apiKey) {
+  if (!config?.proxyEndpoint) {
     statusEl.innerHTML = '<span class="conn-dot conn-disconnected"></span> Not configured';
     return;
   }

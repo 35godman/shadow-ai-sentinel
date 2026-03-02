@@ -345,3 +345,53 @@ describe("Scan options", () => {
     expect(result.detections.length).toBeLessThanOrEqual(2);
   });
 });
+
+// ============================================================
+// FALSE POSITIVE PREVENTION TESTS (post-fix validation)
+// ============================================================
+
+describe("False positive prevention", () => {
+  it("does not flag connection strings without credentials", () => {
+    // mongodb://host/db with no user:pass@ should NOT be flagged as CREDENTIALS
+    const result = scanText("uri = mongodb://localhost:27017/mydb");
+    const credDets = result.detections.filter(d => d.entityType === "CREDENTIALS"
+      && d.matchedText.startsWith("mongodb://"));
+    expect(credDets).toHaveLength(0);
+  });
+
+  it("flags connection strings that contain credentials", () => {
+    const result = scanText("DB: postgres://user:secret@db.internal:5432/prod");
+    expect(result.detections.some(d => d.entityType === "CREDENTIALS")).toBe(true);
+  });
+
+  it("does not flag low-entropy anthropic key lookalikes", () => {
+    // sk-ant- prefix but all same character — entropy too low for a real key
+    const result = scanText("key = sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const apiKeys = result.detections.filter(d =>
+      d.entityType === "API_KEY" && d.matchedText.includes("sk-ant-aaa")
+    );
+    expect(apiKeys).toHaveLength(0);
+  });
+
+  it("detects high-entropy anthropic keys", () => {
+    const result = scanText("ANTHROPIC_KEY=sk-ant-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd");
+    expect(result.detections.some(d => d.entityType === "API_KEY")).toBe(true);
+  });
+
+  it("does not flag ICD-like codes outside medical context", () => {
+    // "E11.65" as a standalone value (version number, model ID) should NOT match
+    const result = scanText("Component version E11.65 released");
+    const diagDets = result.detections.filter(d => d.entityType === "DIAGNOSIS");
+    expect(diagDets).toHaveLength(0);
+  });
+
+  it("detects ICD-10 codes with medical context prefix", () => {
+    const result = scanText("Diagnosis: E11.65 and ICD E10");
+    expect(result.detections.some(d => d.entityType === "DIAGNOSIS")).toBe(true);
+  });
+
+  it("detects github oauth tokens (gho_ prefix)", () => {
+    const result = scanText("token: gho_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh12");
+    expect(result.detections.some(d => d.entityType === "API_KEY")).toBe(true);
+  });
+});

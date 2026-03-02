@@ -146,6 +146,7 @@ export const PATTERNS: RegexPattern[] = [
     entityType: "API_KEY",
     name: "Anthropic API Key",
     pattern: /\b(sk-ant-[a-zA-Z0-9_-]{20,})\b/g,
+    validator: highEntropySecret,
     sensitivityLevel: "CRITICAL",
     complianceFrameworks: ["SOC2"],
     description: "Anthropic API key",
@@ -283,13 +284,14 @@ export const PATTERNS: RegexPattern[] = [
     description: "National Provider Identifier (10-digit)",
   },
   {
+    // Requires a medical context prefix to avoid matching version numbers, model IDs, etc.
     id: "icd10",
     entityType: "DIAGNOSIS",
     name: "ICD-10 Code",
-    pattern: /\b([A-TV-Z]\d{2}(?:\.\d{1,4})?)\b/g,
+    pattern: /\b(?:ICD|DX|diagnosis|code)[-:\s]*([A-TV-Z]\d{2}(?:\.\d{1,4})?)\b/gi,
     sensitivityLevel: "HIGH",
     complianceFrameworks: ["HIPAA"],
-    description: "ICD-10 diagnosis code",
+    description: "ICD-10 diagnosis code with required medical context prefix",
   },
   {
     id: "dea-number",
@@ -359,13 +361,14 @@ export const PATTERNS: RegexPattern[] = [
     description: "Import/require statement",
   },
   {
+    // Requires user:pass@ to avoid flagging bare connection strings without credentials.
     id: "connection-string",
     entityType: "CREDENTIALS",
     name: "Database Connection String",
-    pattern: /((?:mongodb|postgres|mysql|redis|amqp):\/\/[^\s'"]+)/g,
+    pattern: /((?:mongodb|postgres|mysql|redis|amqp):\/\/[^:\s'"]+:[^@\s'"]+@[^\s'"]+)/g,
     sensitivityLevel: "CRITICAL",
     complianceFrameworks: ["SOC2"],
-    description: "Database connection URI (may contain credentials)",
+    description: "Database connection URI containing credentials (user:pass@host)",
   },
   {
     id: "private-key",

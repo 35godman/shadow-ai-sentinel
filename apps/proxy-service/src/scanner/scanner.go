@@ -1,10 +1,12 @@
 package scanner
 
 import (
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ============================================================
@@ -55,6 +57,12 @@ var Patterns = []Pattern{
 		Validator: validateSSN,
 		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"HIPAA", "SOC2", "CCPA"},
 	},
+	{
+		ID: "ssn-nodash", EntityType: "SSN", Name: "US SSN (No Dash)",
+		Regex: regexp.MustCompile(`\b(\d{9})\b`),
+		Validator: validateSSN,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"HIPAA", "SOC2", "CCPA"},
+	},
 
 	// --- Credit Cards ---
 	{
@@ -86,11 +94,17 @@ var Patterns = []Pattern{
 	{
 		ID: "anthropic-key", EntityType: "API_KEY", Name: "Anthropic Key",
 		Regex: regexp.MustCompile(`\b(sk-ant-[a-zA-Z0-9_-]{20,})\b`),
+		Validator: highEntropy,
 		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2"},
 	},
 	{
 		ID: "github-token", EntityType: "API_KEY", Name: "GitHub PAT",
 		Regex: regexp.MustCompile(`\b(ghp_[a-zA-Z0-9]{36,})\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"SOC2"},
+	},
+	{
+		ID: "github-oauth", EntityType: "API_KEY", Name: "GitHub OAuth Token",
+		Regex: regexp.MustCompile(`\b(gho_[a-zA-Z0-9]{36,})\b`),
 		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"SOC2"},
 	},
 	{
@@ -108,6 +122,13 @@ var Patterns = []Pattern{
 	{
 		ID: "aws-access-key", EntityType: "AWS_KEY", Name: "AWS Access Key",
 		Regex: regexp.MustCompile(`\b(AKIA[0-9A-Z]{16})\b`),
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
+	},
+	{
+		// AWS secret key: 40-char base64-like string with high entropy and mixed case+digits.
+		ID: "aws-secret-key", EntityType: "AWS_KEY", Name: "AWS Secret Access Key",
+		Regex: regexp.MustCompile(`\b([a-zA-Z0-9/+=]{40})\b`),
+		Validator: awsSecretValidator,
 		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
 	},
 	{
@@ -129,6 +150,12 @@ var Patterns = []Pattern{
 		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"GDPR", "CCPA"},
 	},
 	{
+		ID: "phone-intl", EntityType: "PHONE", Name: "International Phone",
+		Regex:     regexp.MustCompile(`(\+[1-9]\d{1,2}[\s.\-]?\d{2,4}[\s.\-]?\d{3,4}[\s.\-]?\d{3,4})`),
+		Validator: validateIntlPhone,
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"GDPR", "CCPA"},
+	},
+	{
 		ID: "ipv4-private", EntityType: "IP_ADDRESS", Name: "Private IP",
 		Regex: regexp.MustCompile(`\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b`),
 		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"SOC2"},
@@ -141,8 +168,14 @@ var Patterns = []Pattern{
 		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"HIPAA"},
 	},
 	{
+		// Requires a medical context prefix to avoid matching version numbers, model IDs, etc.
 		ID: "icd10", EntityType: "DIAGNOSIS", Name: "ICD-10",
-		Regex: regexp.MustCompile(`\b([A-TV-Z]\d{2}(?:\.\d{1,4})?)\b`),
+		Regex: regexp.MustCompile(`(?i)\b(?:ICD|DX|diagnosis|code)[-:\s]*([A-TV-Z]\d{2}(?:\.\d{1,4})?)\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"HIPAA"},
+	},
+	{
+		ID: "dea-number", EntityType: "MEDICAL_ID", Name: "DEA Number",
+		Regex: regexp.MustCompile(`(?i)\b(DEA[:\s#]*[A-Z]{2}\d{7})\b`),
 		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"HIPAA"},
 	},
 
@@ -152,11 +185,18 @@ var Patterns = []Pattern{
 		Regex: regexp.MustCompile(`\b([A-Z]{2}\d{2}[\s]?[A-Z0-9]{4}[\s]?(?:[A-Z0-9]{4}[\s]?){1,7}[A-Z0-9]{1,4})\b`),
 		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"PCI-DSS", "GDPR"},
 	},
+	{
+		// Requires context keyword to avoid matching bare 9-digit numbers.
+		ID: "routing-number", EntityType: "FINANCIAL_ACCOUNT", Name: "US Routing Number",
+		Regex: regexp.MustCompile(`(?i)\b((?:routing|aba|rtn)[:\s#]*\d{9})\b`),
+		SensitivityLevel: "HIGH", ComplianceFrameworks: []string{"PCI-DSS"},
+	},
 
 	// --- Secrets ---
 	{
+		// Requires user:pass@ to avoid flagging bare connection strings without credentials.
 		ID: "connection-string", EntityType: "CREDENTIALS", Name: "DB Connection String",
-		Regex: regexp.MustCompile(`((?:mongodb|postgres|mysql|redis|amqp):\/\/[^\s'"]+)`),
+		Regex: regexp.MustCompile(`((?:mongodb|postgres|mysql|redis|amqp):\/\/[^:\s'"]+:[^@\s'"]+@[^\s'"]+)`),
 		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2"},
 	},
 	{
@@ -175,6 +215,16 @@ var Patterns = []Pattern{
 		ID: "code-function-js", EntityType: "SOURCE_CODE", Name: "JS/TS Function",
 		Regex: regexp.MustCompile(`\b((?:export\s+)?(?:async\s+)?function\s+[a-zA-Z_]\w*\s*\([^)]*\))`),
 		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"IP"},
+	},
+	{
+		ID: "code-class", EntityType: "SOURCE_CODE", Name: "Class Definition",
+		Regex: regexp.MustCompile(`\b((?:export\s+)?class\s+[A-Z]\w*(?:\s+extends\s+\w+)?(?:\s+implements\s+\w+)?\s*\{)`),
+		SensitivityLevel: "MEDIUM", ComplianceFrameworks: []string{"IP"},
+	},
+	{
+		ID: "code-import", EntityType: "SOURCE_CODE", Name: "Import Statement",
+		Regex: regexp.MustCompile(`\b(import\s+(?:\{[^}]+\}\s+from\s+|[\w*]+\s+from\s+)?['"][^'"]+['"])`),
+		SensitivityLevel: "LOW", ComplianceFrameworks: []string{"IP"},
 	},
 }
 
@@ -200,9 +250,9 @@ func ScanText(text string, enabledTypes []string) ScanResult {
 
 		matches := p.Regex.FindAllStringSubmatchIndex(text, -1)
 		for _, loc := range matches {
-			// loc[0], loc[1] = full match; loc[2], loc[3] = capture group 1
-			startOff, endOff := loc[0], loc[1]
-			matchText := text[startOff:endOff]
+			// loc[0], loc[1] = full match byte positions; loc[2], loc[3] = capture group 1
+			byteStart, byteEnd := loc[0], loc[1]
+			matchText := text[byteStart:byteEnd]
 
 			// Use capture group if available
 			if len(loc) >= 4 && loc[2] >= 0 {
@@ -214,23 +264,29 @@ func ScanText(text string, enabledTypes []string) ScanResult {
 				continue
 			}
 
-			// Dedup
-			key := strings.Join([]string{string(rune(startOff)), string(rune(endOff))}, "-")
+			// Convert byte offsets to rune (character) offsets for Unicode safety.
+			// Go's regexp returns byte positions; the redactor works with rune positions.
+			runeStart := utf8.RuneCountInString(text[:byteStart])
+			runeEnd := utf8.RuneCountInString(text[:byteEnd])
+
+			// Dedup: use rune-based offsets as the key (fixes the string(rune(int)) bug
+			// which converted integers to Unicode codepoints instead of their decimal string).
+			key := fmt.Sprintf("%d-%d", runeStart, runeEnd)
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
 
 			detections = append(detections, Detection{
-				ID:               p.ID + "-" + string(rune(startOff)),
+				ID:               fmt.Sprintf("%s-%d", p.ID, runeStart),
 				EntityType:       p.EntityType,
 				Confidence:       0.95,
 				Source:           "REGEX",
 				MatchedText:      matchText,
 				RedactedText:     "[" + p.EntityType + "_REDACTED]",
 				ContextRiskScore: p.SensitivityLevel,
-				StartOffset:      startOff,
-				EndOffset:        endOff,
+				StartOffset:      runeStart,
+				EndOffset:        runeEnd,
 				PatternID:        p.ID,
 			})
 		}
@@ -341,6 +397,89 @@ func validatePhone(phone string) bool {
 		return -1
 	}, phone)
 	return len(digits) >= 10 && len(digits) <= 11
+}
+
+func validateIntlPhone(phone string) bool {
+	digits := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, phone)
+	return len(digits) >= 7 && len(digits) <= 15
+}
+
+// awsSecretValidator returns true only for high-entropy 40-char strings with
+// mixed upper/lower/digit characters — characteristics of real AWS secret keys.
+func awsSecretValidator(match string) bool {
+	if len(match) != 40 {
+		return false
+	}
+	hasUpper := strings.ContainsAny(match, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	hasLower := strings.ContainsAny(match, "abcdefghijklmnopqrstuvwxyz")
+	hasDigit := strings.ContainsAny(match, "0123456789")
+	return shannonEntropy(match) > 4.5 && hasUpper && hasLower && hasDigit
+}
+
+// ============================================================
+// ML DETECTION MERGE
+// ============================================================
+
+// MergeMLDetections adds non-overlapping ML detections into a regex scan result
+// and re-computes combined risk and recommended action.
+func MergeMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanResult {
+	for _, raw := range mlDets {
+		entityType, _ := raw["entity_type"].(string)
+		matchedText, _ := raw["text"].(string)
+		startRaw, _ := raw["start"].(float64)
+		endRaw, _ := raw["end"].(float64)
+		confidence, _ := raw["confidence"].(float64)
+		riskScore, _ := raw["context_risk_score"].(string)
+		redactedText, _ := raw["redacted_text"].(string)
+
+		start := int(startRaw)
+		end := int(endRaw)
+
+		if entityType == "" {
+			continue
+		}
+		if riskScore == "" {
+			riskScore = "MEDIUM"
+		}
+		if redactedText == "" {
+			redactedText = "[" + entityType + "_REDACTED]"
+		}
+
+		// Skip if overlapping with any existing regex detection.
+		overlaps := false
+		for _, existing := range base.Detections {
+			if start < existing.EndOffset && end > existing.StartOffset {
+				overlaps = true
+				break
+			}
+		}
+		if overlaps {
+			continue
+		}
+
+		base.Detections = append(base.Detections, Detection{
+			ID:               fmt.Sprintf("ml-%s-%d", entityType, start),
+			EntityType:       entityType,
+			Confidence:       confidence,
+			Source:           "ML",
+			MatchedText:      matchedText,
+			RedactedText:     redactedText,
+			ContextRiskScore: riskScore,
+			StartOffset:      start,
+			EndOffset:        end,
+		})
+	}
+
+	// Re-compute risk and action after adding ML detections.
+	base.CombinedRisk = determineCombinedRisk(base.Detections)
+	base.RecommendedAction = determineAction(base.CombinedRisk)
+
+	return base
 }
 
 // ============================================================

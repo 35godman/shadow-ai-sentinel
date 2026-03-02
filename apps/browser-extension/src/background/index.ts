@@ -299,7 +299,7 @@ function startEventFlush() {
 
 async function flushEvents() {
   if (eventBuffer.length === 0 && shadowAiBuffer.length === 0) return;
-  if (!config.proxyEndpoint || !config.apiKey) return;
+  if (!config.proxyEndpoint) return;
 
   const auditBatch = eventBuffer.splice(0, eventBuffer.length);
   const shadowBatch = shadowAiBuffer.splice(0, shadowAiBuffer.length);
@@ -332,7 +332,7 @@ function startConfigPolling() {
 }
 
 async function pollConfig() {
-  if (!config.proxyEndpoint || !config.apiKey) return;
+  if (!config.proxyEndpoint) return;
 
   try {
     const response = await fetch(`${config.proxyEndpoint}/api/v1/config`, {

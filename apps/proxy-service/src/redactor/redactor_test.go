@@ -304,6 +304,147 @@ type detSpec struct {
 	End         int
 }
 
+// ============================================================
+// UNICODE SAFETY TESTS
+// ============================================================
+
+func TestRedact_EmojiText_CorrectOffsets(t *testing.T) {
+	// "😀 hello john@example.com world"
+	// 😀 is 1 rune (4 bytes). Offsets must be rune-based, not byte-based.
+	text := "😀 hello john@example.com world"
+	runes := []rune(text)
+	emailRuneStart := 0
+	for i, r := range runes {
+		if r == 'j' {
+			emailRuneStart = i
+			break
+		}
+	}
+	emailRuneEnd := emailRuneStart + len([]rune("john@example.com"))
+
+	detections := makeDetections([]detSpec{
+		{EntityType: "EMAIL", MatchedText: "john@example.com", Start: emailRuneStart, End: emailRuneEnd},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "john@example.com") {
+		t.Errorf("original email still present: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "[EMAIL_1]") {
+		t.Errorf("expected [EMAIL_1] placeholder, got: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "😀") {
+		t.Errorf("emoji was corrupted in: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, " world") {
+		t.Errorf("trailing text corrupted in: %q", result.RedactedText)
+	}
+}
+
+func TestRedact_CyrillicText_CorrectOffsets(t *testing.T) {
+	// Cyrillic chars are 2 bytes each — byte vs rune offsets diverge.
+	text := "Привет john@example.com мир"
+	runes := []rune(text)
+	emailRuneStart := 0
+	for i, r := range runes {
+		if r == 'j' {
+			emailRuneStart = i
+			break
+		}
+	}
+	emailRuneEnd := emailRuneStart + len([]rune("john@example.com"))
+
+	detections := makeDetections([]detSpec{
+		{EntityType: "EMAIL", MatchedText: "john@example.com", Start: emailRuneStart, End: emailRuneEnd},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "john@example.com") {
+		t.Errorf("original email still present: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "Привет") {
+		t.Errorf("Cyrillic prefix corrupted: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, " мир") {
+		t.Errorf("Cyrillic suffix corrupted: %q", result.RedactedText)
+	}
+}
+
+// ============================================================
+// OVERLAPPING DETECTION MERGE TEST
+// ============================================================
+
+func TestRedact_OverlappingDetections_NoCorruption(t *testing.T) {
+	// Two detections covering the same span — without merging, double-replacement corrupts text.
+	text := "SSN: 078-05-1120 end"
+	detections := makeDetections([]detSpec{
+		{EntityType: "SSN", MatchedText: "078-05-1120", Start: 5, End: 16},
+		{EntityType: "SSN", MatchedText: "078-05-1120", Start: 5, End: 16},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "078-05-1120") {
+		t.Errorf("original SSN still present: %q", result.RedactedText)
+	}
+	if !strings.HasPrefix(result.RedactedText, "SSN: ") {
+		t.Errorf("prefix text corrupted: %q", result.RedactedText)
+	}
+	if !strings.HasSuffix(result.RedactedText, " end") {
+		t.Errorf("suffix text corrupted: %q", result.RedactedText)
+	}
+}
+
+// ============================================================
+// BOUNDS CHECK TEST
+// ============================================================
+
+func TestRedact_OutOfBoundsOffset_Skipped(t *testing.T) {
+	// A detection with end offset beyond text length must be skipped gracefully.
+	text := "Short text"
+	detections := makeDetections([]detSpec{
+		{EntityType: "EMAIL", MatchedText: "foo@bar.com", Start: 5, End: 9999},
+	})
+
+	// Must not panic; should return original text unchanged.
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if result.RedactedText != text {
+		t.Errorf("expected original text when offset out-of-bounds, got: %q", result.RedactedText)
+	}
+}
+
+// ============================================================
+// RE-IDENTIFICATION LONGEST-FIRST ORDER
+// ============================================================
+
+func TestReIdentify_LongestFirst_NoSubstringCollision(t *testing.T) {
+	// [EMAIL_1] is a prefix of [EMAIL_10] — wrong order causes partial replacement and garbled output.
+	mappings := []redactor.Mapping{
+		{Placeholder: "[EMAIL_1]", Original: "alice@example.com", EntityType: "EMAIL"},
+		{Placeholder: "[EMAIL_10]", Original: "zebra@example.com", EntityType: "EMAIL"},
+	}
+
+	response := "Contact [EMAIL_1] and [EMAIL_10] for the report."
+	restored := redactor.ReIdentify(response, mappings)
+
+	if strings.Contains(restored, "[EMAIL_1]") || strings.Contains(restored, "[EMAIL_10]") {
+		t.Errorf("placeholders not fully replaced in: %q", restored)
+	}
+	if !strings.Contains(restored, "alice@example.com") {
+		t.Errorf("alice's email not restored in: %q", restored)
+	}
+	if !strings.Contains(restored, "zebra@example.com") {
+		t.Errorf("zebra's email not restored in: %q", restored)
+	}
+	// Garbled result if [EMAIL_1] replaced before [EMAIL_10]
+	if strings.Contains(restored, "alice@example.com0") {
+		t.Errorf("substring collision: alice's email got '0' appended: %q", restored)
+	}
+}
+
 // makeDetections converts test specs to the anonymous struct type required by RedactFromScanResult.
 func makeDetections(specs []detSpec) []struct {
 	EntityType  string

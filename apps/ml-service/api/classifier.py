@@ -230,27 +230,33 @@ class Classifier:
         Elevate risk based on surrounding context.
         A phone number in a support article = LOW.
         Same phone number preceded by 'patient' = HIGH.
+
+        Context check is PER ENTITY (±150 chars around each detection) — not a global
+        document-level flag. This prevents a single 'patient' mention from elevating
+        ALL entities in the document, including unrelated emails and phone numbers.
         """
         text_lower = text.lower()
-
-        has_medical_context = any(kw in text_lower for kw in MEDICAL_CONTEXT)
+        # Financial and code context are document-level (they affect all entities)
         has_financial_context = any(kw in text_lower for kw in FINANCIAL_CONTEXT)
         has_code_context = any(kw in text_lower for kw in CODE_CONTEXT)
 
         for d in detections:
-            # Get surrounding context (256 chars window)
-            ctx_start = max(0, d.start - 128)
-            ctx_end = min(len(text), d.end + 128)
+            # Per-entity context window: 150 chars around this specific detection
+            ctx_start = max(0, d.start - 150)
+            ctx_end = min(len(text), d.end + 150)
             context_window = text[ctx_start:ctx_end].lower()
 
-            # Medical context elevates PII
+            # Medical context check is PER ENTITY — only elevates entities
+            # that actually appear near medical keywords.
+            has_medical_context = any(kw in context_window for kw in MEDICAL_CONTEXT)
+
+            # Medical context elevates PII near medical keywords
             if has_medical_context:
                 if d.entity_type in ("PERSON", "PHONE", "EMAIL", "LOCATION"):
                     d.context_risk_score = SensitivityLevel.HIGH
                     d.confidence = min(d.confidence * 1.3, 1.0)
                 if d.entity_type == "PERSON" and any(kw in context_window for kw in ("patient", "diagnosis", "treatment")):
                     d.context_risk_score = SensitivityLevel.CRITICAL
-                    d.entity_type = "PERSON"  # Could flag as PHI
 
             # Financial context
             if has_financial_context:
@@ -298,9 +304,17 @@ class Classifier:
         return SensitivityLevel.LOW
 
     def _overlaps(self, detection: MLDetection, existing: list[MLDetection]) -> bool:
-        """Check if a detection overlaps with existing ones (for dedup)."""
-        for e in existing:
-            if (detection.start < e.end and detection.end > e.start):
+        """
+        Check if a detection overlaps with existing ones (for dedup).
+        When an overlap is found, keeps the higher-confidence detection in-place
+        (replacing the existing one if the new detection is better).
+        Returns True when an overlap was found (caller should not append the detection).
+        """
+        for i, e in enumerate(existing):
+            if detection.start < e.end and detection.end > e.start:
+                # Overlap found: replace existing with new if new has higher confidence
+                if detection.confidence > e.confidence:
+                    existing[i] = detection
                 return True
         return False
 

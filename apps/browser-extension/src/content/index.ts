@@ -40,35 +40,60 @@ document.addEventListener("paste", async (event: ClipboardEvent) => {
   const pastedText = event.clipboardData?.getData("text/plain");
   if (!pastedText || pastedText.length < 5) return; // Ignore trivial pastes
 
-  const result = await scanContent(pastedText, "paste");
+  // ── SYNCHRONOUS PHASE ───────────────────────────────────────
+  // event.preventDefault() MUST be called synchronously — after any
+  // await the browser has already inserted the text and it's too late.
+  // Do a fast local scan (<5ms) and make the enforcement decision NOW,
+  // before yielding to any async operations.
+  const localResult = scanText(pastedText);
+  const localAction: PolicyAction = learningMode ? "LOG" : localResult.recommendedAction;
 
-  if (result.action === "BLOCK") {
+  let pasteWasPrevented = false;
+
+  if (localAction === "BLOCK") {
     event.preventDefault();
     event.stopImmediatePropagation();
+    pasteWasPrevented = true;
+  } else if (localAction === "REDACT" && localResult.detections.length > 0) {
+    // Prevent the original paste; we will re-insert the redacted text below.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    pasteWasPrevented = true;
+  }
+
+  // ── ASYNC PHASE ─────────────────────────────────────────────
+  // Now we can safely await — the paste decision has already been enforced.
+  // Contact background/proxy for the authoritative result + audit logging.
+  if (localResult.detections.length === 0 && !pasteWasPrevented) return;
+
+  const result = await scanContent(pastedText, "paste");
+
+  if (result.action === "BLOCK" || localAction === "BLOCK") {
     showUserNotification(result.userMessage || "Paste blocked: sensitive data detected", "error");
+    return;
+  }
+
+  if (result.action === "REDACT" || localAction === "REDACT") {
+    // Paste was already prevented above; insert the redacted text instead.
+    const redacted = result.redactedContent || redactText(pastedText, localResult.detections);
+    if (redacted) {
+      const target = event.target as HTMLElement;
+      if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+        const start = target.selectionStart || 0;
+        const end = target.selectionEnd || 0;
+        target.value = target.value.substring(0, start) + redacted + target.value.substring(end);
+        // Trigger input event so the AI tool's framework picks up the change
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+      } else if (target.contentEditable === "true") {
+        document.execCommand("insertText", false, redacted);
+      }
+    }
+    showUserNotification("Sensitive data was automatically redacted before sending", "info");
     return;
   }
 
   if (result.action === "WARN") {
     showUserNotification(result.userMessage || "Warning: sensitive data detected in paste", "warning");
-  }
-
-  if (result.action === "REDACT" && result.redactedContent) {
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    // Insert redacted content instead
-    const target = event.target as HTMLElement;
-    if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
-      const start = target.selectionStart || 0;
-      const end = target.selectionEnd || 0;
-      const current = target.value;
-      target.value = current.substring(0, start) + result.redactedContent + current.substring(end);
-      // Trigger input event so the AI tool's framework picks up the change
-      target.dispatchEvent(new Event("input", { bubbles: true }));
-    } else if (target.contentEditable === "true") {
-      document.execCommand("insertText", false, result.redactedContent);
-    }
-    showUserNotification("Sensitive data was automatically redacted before sending", "info");
   }
 }, true); // Capture phase to intercept before the AI tool's handler
 
@@ -185,11 +210,25 @@ document.addEventListener("keydown", async (event: KeyboardEvent) => {
   const text = getElementText(target);
   if (text.length < 5) return;
 
-  const result = await scanContent(text, "prompt");
+  // ── SYNCHRONOUS PHASE ───────────────────────────────────────
+  // Same principle as paste: call preventDefault() synchronously based on
+  // local scan before any await, otherwise the submission fires immediately.
+  const localResult = scanText(text);
+  const localAction: PolicyAction = learningMode ? "LOG" : localResult.recommendedAction;
 
-  if (result.action === "BLOCK") {
+  let submissionWasBlocked = false;
+  if (localAction === "BLOCK") {
     event.preventDefault();
     event.stopImmediatePropagation();
+    submissionWasBlocked = true;
+  }
+
+  // ── ASYNC PHASE ─────────────────────────────────────────────
+  if (localResult.detections.length === 0 && !submissionWasBlocked) return;
+
+  const result = await scanContent(text, "prompt");
+
+  if (result.action === "BLOCK" || submissionWasBlocked) {
     showUserNotification(result.userMessage || "Submission blocked: sensitive data detected", "error");
   }
 }, true);

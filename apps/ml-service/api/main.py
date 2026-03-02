@@ -113,13 +113,22 @@ async def classify(request: ScanRequest):
     )
 
 
+MAX_BATCH_SIZE = 50
+
+
 @app.post("/api/v1/classify/batch")
 async def classify_batch(requests: list[ScanRequest]):
     """Batch classification for multiple texts."""
+    if len(requests) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch too large: max {MAX_BATCH_SIZE} items, got {len(requests)}",
+        )
+
     classifier = get_classifier()
     results = []
 
-    for req in requests[:20]:  # Max 20 per batch
+    for req in requests:
         try:
             result = classifier.scan(req.text, req.language)
             results.append({
