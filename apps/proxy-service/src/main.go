@@ -274,9 +274,9 @@ func handleScan(cfg Config) http.HandlerFunc {
 		if cfg.MLServiceURL != "" {
 			mlDetections := callMLService(cfg.MLServiceURL, req.Content)
 			if len(mlDetections) > 0 {
-				log.Printf("[Sentinel] ML: %d additional detections domain=%s",
-					len(mlDetections), req.TargetDomain)
-				// TODO(Phase 2): merge ML detections into scanResult with dedup
+				scanResult = scanner.MergeMLDetections(scanResult, mlDetections)
+				log.Printf("[Sentinel] ML: merged %d detections domain=%s new_risk=%s",
+					len(mlDetections), req.TargetDomain, scanResult.CombinedRisk)
 			}
 		}
 

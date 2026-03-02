@@ -133,15 +133,23 @@ func (rt *Router) Decide(sensitivity string, targetProvider string, onPremEndpoi
 	}
 }
 
-// Forward sends the (possibly redacted) prompt to the target LLM
+// Forward sends the (possibly redacted) prompt to the target LLM.
+// If req.Model is non-empty, it overrides the model chosen by Decide().
 func (rt *Router) Forward(ctx context.Context, decision RouteDecision, req LLMRequest) (*LLMResponse, error) {
 	start := time.Now()
+
+	// Allow the caller to override the routed model with a specific requested model.
+	if req.Model != "" {
+		decision.Model = req.Model
+	}
 
 	switch decision.Provider {
 	case "openai":
 		return rt.forwardOpenAI(ctx, decision, req, start)
 	case "anthropic":
 		return rt.forwardAnthropic(ctx, decision, req, start)
+	case "google":
+		return rt.forwardGoogle(ctx, decision, req, start)
 	case "ollama":
 		return rt.forwardOllama(ctx, decision, req, start)
 	default:
@@ -283,6 +291,79 @@ func (rt *Router) forwardOllama(ctx context.Context, decision RouteDecision, req
 		TokensUsed: ollamaResp.EvalCount,
 		LatencyMs:  float64(time.Since(start).Milliseconds()),
 		RoutedTo:   "onprem",
+	}, nil
+}
+
+func (rt *Router) forwardGoogle(ctx context.Context, decision RouteDecision, req LLMRequest, start time.Time) (*LLMResponse, error) {
+	messages := req.Messages
+	if len(messages) == 0 && req.Prompt != "" {
+		messages = []Message{{Role: "user", Content: req.Prompt}}
+	}
+
+	// Convert messages to Gemini "contents" format.
+	// Gemini uses "model" for the assistant role.
+	type part struct {
+		Text string `json:"text"`
+	}
+	type content struct {
+		Role  string `json:"role"`
+		Parts []part `json:"parts"`
+	}
+	contents := make([]content, 0, len(messages))
+	for _, m := range messages {
+		role := m.Role
+		if role == "assistant" {
+			role = "model"
+		}
+		contents = append(contents, content{
+			Role:  role,
+			Parts: []part{{Text: m.Content}},
+		})
+	}
+
+	body := map[string]interface{}{
+		"contents": contents,
+		"generationConfig": map[string]interface{}{
+			"maxOutputTokens": coalesce(req.MaxTokens, 2048),
+			"temperature":     req.Temperature,
+		},
+	}
+
+	// Gemini uses the API key as a URL parameter, not in Authorization header.
+	endpoint := decision.EndpointURL + "?key=" + rt.cfg.GoogleKey
+
+	respBody, err := rt.doHTTP(ctx, endpoint, body, nil)
+	if err != nil {
+		return nil, fmt.Errorf("google request: %w", err)
+	}
+
+	var geminiResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+		UsageMetadata struct {
+			TotalTokenCount int `json:"totalTokenCount"`
+		} `json:"usageMetadata"`
+	}
+	if err := json.Unmarshal(respBody, &geminiResp); err != nil {
+		return nil, fmt.Errorf("parse google response: %w", err)
+	}
+
+	content2 := ""
+	if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+		content2 = geminiResp.Candidates[0].Content.Parts[0].Text
+	}
+
+	return &LLMResponse{
+		Content:    content2,
+		Model:      decision.Model,
+		TokensUsed: geminiResp.UsageMetadata.TotalTokenCount,
+		LatencyMs:  float64(time.Since(start).Milliseconds()),
+		RoutedTo:   decision.Target,
 	}, nil
 }
 

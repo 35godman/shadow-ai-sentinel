@@ -463,3 +463,234 @@ func summarizeDetections(detections []scanner.Detection) []string {
 	}
 	return out
 }
+
+// ============================================================
+// DEDUP KEY BUG FIX — string(rune(int)) was converting ints
+// to Unicode codepoints, causing every detection to appear unique.
+// ============================================================
+
+func TestScanText_NoDuplicateDetections_SamePattern(t *testing.T) {
+	// A single SSN in a sentence should produce exactly one SSN detection.
+	result := scanner.ScanText("SSN is 078-05-1120 confirmed", nil)
+
+	count := countEntityType(result.Detections, "SSN")
+	if count != 1 {
+		t.Errorf("expected exactly 1 SSN detection, got %d (dedup may be broken)", count)
+	}
+}
+
+// ============================================================
+// UNICODE OFFSET CORRECTNESS
+// ============================================================
+
+func TestScanText_Unicode_RuneOffsets_Correct(t *testing.T) {
+	// Emoji is 4 bytes but 1 rune; byte-based offsets will cut into the emoji.
+	text := "😀 SSN: 078-05-1120"
+	result := scanner.ScanText(text, nil)
+
+	var ssn *scanner.Detection
+	for i := range result.Detections {
+		if result.Detections[i].EntityType == "SSN" {
+			ssn = &result.Detections[i]
+			break
+		}
+	}
+	if ssn == nil {
+		t.Fatal("SSN not detected in unicode text")
+	}
+
+	runes := []rune(text)
+	if ssn.StartOffset < 0 || ssn.EndOffset > len(runes) {
+		t.Fatalf("offsets out of rune range: start=%d end=%d runeLen=%d",
+			ssn.StartOffset, ssn.EndOffset, len(runes))
+	}
+	matched := string(runes[ssn.StartOffset:ssn.EndOffset])
+	if !strings.Contains(matched, "078-05-1120") {
+		t.Errorf("rune-based offset extraction wrong: %q (expected to contain SSN)", matched)
+	}
+}
+
+func TestScanText_CyrillicText_SSNOffsets_Correct(t *testing.T) {
+	// Cyrillic chars are 2 bytes each; byte vs rune offsets diverge significantly.
+	text := "Привет SSN: 078-05-1120"
+	result := scanner.ScanText(text, nil)
+
+	var ssn *scanner.Detection
+	for i := range result.Detections {
+		if result.Detections[i].EntityType == "SSN" {
+			ssn = &result.Detections[i]
+			break
+		}
+	}
+	if ssn == nil {
+		t.Fatal("SSN not detected in Cyrillic text")
+	}
+
+	runes := []rune(text)
+	if ssn.StartOffset < 0 || ssn.EndOffset > len(runes) {
+		t.Fatalf("offsets out of rune range: start=%d end=%d runeLen=%d",
+			ssn.StartOffset, ssn.EndOffset, len(runes))
+	}
+	matched := string(runes[ssn.StartOffset:ssn.EndOffset])
+	if !strings.Contains(matched, "078-05-1120") {
+		t.Errorf("rune-based offset extraction wrong: %q", matched)
+	}
+}
+
+// ============================================================
+// MISSING PATTERN TESTS (patterns added to match TypeScript)
+// ============================================================
+
+func TestGithubOAuth_gho_Detected(t *testing.T) {
+	result := scanner.ScanText("token: gho_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abc", nil)
+	assertHasEntityType(t, result.Detections, "API_KEY")
+}
+
+func TestIntlPhone_PlusCountryCode_Detected(t *testing.T) {
+	result := scanner.ScanText("Call: +44 20 7946 0958", nil)
+	assertHasEntityType(t, result.Detections, "PHONE")
+}
+
+func TestDEANumber_Detected(t *testing.T) {
+	result := scanner.ScanText("DEA# AB1234567", nil)
+	assertHasEntityType(t, result.Detections, "MEDICAL_ID")
+}
+
+func TestRoutingNumber_Detected(t *testing.T) {
+	result := scanner.ScanText("routing: 021000021", nil)
+	assertHasEntityType(t, result.Detections, "FINANCIAL_ACCOUNT")
+}
+
+func TestCodeClass_Detected(t *testing.T) {
+	result := scanner.ScanText("export class PaymentProcessor extends BaseProcessor {", nil)
+	assertHasEntityType(t, result.Detections, "SOURCE_CODE")
+}
+
+func TestCodeImport_Detected(t *testing.T) {
+	result := scanner.ScanText("import { useState } from 'react'", nil)
+	assertHasEntityType(t, result.Detections, "SOURCE_CODE")
+}
+
+// ============================================================
+// FALSE POSITIVE FIX TESTS
+// ============================================================
+
+func TestAnthropicKey_LowEntropy_NotDetected(t *testing.T) {
+	// sk-ant- prefix but all same character — low entropy, should NOT be flagged.
+	result := scanner.ScanText("key = sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+
+	for _, d := range result.Detections {
+		if d.EntityType == "API_KEY" && strings.Contains(d.MatchedText, "sk-ant-aaa") {
+			t.Errorf("low-entropy sk-ant- string incorrectly flagged as API_KEY: %q", d.MatchedText)
+		}
+	}
+}
+
+func TestConnectionString_NoCredentials_NotDetected(t *testing.T) {
+	// mongodb:// with no user:pass@ should NOT be flagged.
+	result := scanner.ScanText("uri = mongodb://localhost:27017/mydb", nil)
+	assertNoEntityType(t, result.Detections, "CREDENTIALS")
+}
+
+func TestConnectionString_WithCredentials_Detected(t *testing.T) {
+	result := scanner.ScanText("uri = mongodb://admin:secret@cluster.example.com:27017/db", nil)
+	assertHasEntityType(t, result.Detections, "CREDENTIALS")
+}
+
+func TestICD10_NoMedicalContext_NotDetected(t *testing.T) {
+	// Standalone ICD-10-like code without a context prefix should NOT be flagged.
+	result := scanner.ScanText("Component version E11.65 released", nil)
+	assertNoEntityType(t, result.Detections, "DIAGNOSIS")
+}
+
+func TestICD10_WithDiagnosisPrefix_Detected(t *testing.T) {
+	result := scanner.ScanText("diagnosis: E11.65", nil)
+	assertHasEntityType(t, result.Detections, "DIAGNOSIS")
+}
+
+func TestAWSSecretKey_HighEntropy_Detected(t *testing.T) {
+	// Mixed-case + digits, 40 chars, high entropy — real AWS secret key.
+	result := scanner.ScanText("AWS_SECRET=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", nil)
+	assertHasEntityType(t, result.Detections, "AWS_KEY")
+}
+
+func TestAWSSecretKey_AllSameChar_NotDetected(t *testing.T) {
+	// 40 chars but zero entropy — definitely not a real key.
+	result := scanner.ScanText("value = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	assertNoEntityType(t, result.Detections, "AWS_KEY")
+}
+
+// ============================================================
+// ML MERGE TESTS
+// ============================================================
+
+func TestMergeMLDetections_AddsNonOverlapping(t *testing.T) {
+	base := scanner.ScanResult{
+		Detections:        []scanner.Detection{},
+		CombinedRisk:      "LOW",
+		RecommendedAction: "LOG",
+	}
+
+	mlDets := []map[string]interface{}{
+		{
+			"entity_type":        "PERSON",
+			"text":               "John Doe",
+			"start":              float64(0),
+			"end":                float64(8),
+			"confidence":         float64(0.85),
+			"context_risk_score": "MEDIUM",
+			"redacted_text":      "[PERSON_REDACTED]",
+		},
+	}
+
+	merged := scanner.MergeMLDetections(base, mlDets)
+
+	if len(merged.Detections) != 1 {
+		t.Errorf("expected 1 detection after ML merge, got %d", len(merged.Detections))
+	}
+	if merged.Detections[0].EntityType != "PERSON" {
+		t.Errorf("expected PERSON detection, got %s", merged.Detections[0].EntityType)
+	}
+	if merged.CombinedRisk != "MEDIUM" {
+		t.Errorf("expected MEDIUM risk after ML merge, got %s", merged.CombinedRisk)
+	}
+}
+
+func TestMergeMLDetections_SkipsOverlapping(t *testing.T) {
+	// Regex already detected SSN at offset 5-16.
+	base := scanner.ScanResult{
+		Detections: []scanner.Detection{
+			{
+				ID:               "ssn-5",
+				EntityType:       "SSN",
+				Source:           "REGEX",
+				StartOffset:      5,
+				EndOffset:        16,
+				ContextRiskScore: "CRITICAL",
+				Confidence:       0.95,
+				RedactedText:     "[SSN_REDACTED]",
+			},
+		},
+		CombinedRisk:      "CRITICAL",
+		RecommendedAction: "BLOCK",
+	}
+
+	// ML also detects at the same offset — should be skipped.
+	mlDets := []map[string]interface{}{
+		{
+			"entity_type":        "SSN",
+			"text":               "078-05-1120",
+			"start":              float64(5),
+			"end":                float64(16),
+			"confidence":         float64(0.90),
+			"context_risk_score": "CRITICAL",
+			"redacted_text":      "[SSN_REDACTED]",
+		},
+	}
+
+	merged := scanner.MergeMLDetections(base, mlDets)
+
+	if len(merged.Detections) != 1 {
+		t.Errorf("expected 1 detection (overlapping ML skipped), got %d", len(merged.Detections))
+	}
+}
