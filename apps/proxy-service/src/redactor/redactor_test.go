@@ -445,6 +445,232 @@ func TestReIdentify_LongestFirst_NoSubstringCollision(t *testing.T) {
 	}
 }
 
+// ============================================================
+// OVERLAPPING DETECTIONS — partial, containment, adjacent
+// ============================================================
+
+func TestRedact_OverlappingPartial(t *testing.T) {
+	// Two detections that partially overlap: [0,10) and [5,15).
+	// mergeOverlapping should keep the larger span.
+	text := "0123456789ABCDE end"
+	detections := makeDetections([]detSpec{
+		{EntityType: "SSN", MatchedText: "0123456789", Start: 0, End: 10},
+		{EntityType: "SSN", MatchedText: "56789ABCDE", Start: 5, End: 15},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	// After merge, only one detection survives (the wider span [0,15) or the later-ending one).
+	if strings.Contains(result.RedactedText, "0123456789") {
+		t.Errorf("original text still present after partial overlap redaction: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "[SSN_") {
+		t.Errorf("expected [SSN_N] placeholder in: %q", result.RedactedText)
+	}
+	if !strings.HasSuffix(result.RedactedText, " end") {
+		t.Errorf("suffix text corrupted after partial overlap: %q", result.RedactedText)
+	}
+}
+
+func TestRedact_OverlappingFullContainment(t *testing.T) {
+	// One detection entirely inside another: [0,10) contains [3,7).
+	// mergeOverlapping should keep the outer one.
+	text := "ABCDEFGHIJ rest"
+	detections := makeDetections([]detSpec{
+		{EntityType: "EMAIL", MatchedText: "ABCDEFGHIJ", Start: 0, End: 10},
+		{EntityType: "EMAIL", MatchedText: "DEFG", Start: 3, End: 7},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "ABCDEFGHIJ") {
+		t.Errorf("original text still present: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "[EMAIL_1]") {
+		t.Errorf("expected [EMAIL_1] placeholder in: %q", result.RedactedText)
+	}
+	if !strings.HasSuffix(result.RedactedText, " rest") {
+		t.Errorf("suffix corrupted: %q", result.RedactedText)
+	}
+}
+
+func TestRedact_AdjacentDetections(t *testing.T) {
+	// Two detections back-to-back with zero gap: [0,5) and [5,10).
+	text := "AAAAABBBBB end"
+	detections := makeDetections([]detSpec{
+		{EntityType: "SSN", MatchedText: "AAAAA", Start: 0, End: 5},
+		{EntityType: "EMAIL", MatchedText: "BBBBB", Start: 5, End: 10},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "AAAAA") {
+		t.Errorf("first entity still present: %q", result.RedactedText)
+	}
+	if strings.Contains(result.RedactedText, "BBBBB") {
+		t.Errorf("second entity still present: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "[SSN_1]") {
+		t.Errorf("expected [SSN_1] in: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "[EMAIL_1]") {
+		t.Errorf("expected [EMAIL_1] in: %q", result.RedactedText)
+	}
+}
+
+// ============================================================
+// MULTIBYTE CHARACTER TESTS — CJK, emoji, mixed scripts
+// ============================================================
+
+func TestRedact_MultibyteCJK(t *testing.T) {
+	// CJK characters (3 bytes each, 1 rune each).
+	// "你好 secret@email.com 世界"
+	text := "你好 secret@email.com 世界"
+	runes := []rune(text)
+	// Find "secret@email.com" rune positions.
+	emailStr := "secret@email.com"
+	emailStart := -1
+	for i := range runes {
+		if string(runes[i:i+len([]rune(emailStr))]) == emailStr {
+			emailStart = i
+			break
+		}
+	}
+	if emailStart == -1 {
+		t.Fatal("could not find email in CJK text")
+	}
+	emailEnd := emailStart + len([]rune(emailStr))
+
+	detections := makeDetections([]detSpec{
+		{EntityType: "EMAIL", MatchedText: emailStr, Start: emailStart, End: emailEnd},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "secret@email.com") {
+		t.Errorf("email still present: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "你好") {
+		t.Errorf("CJK prefix corrupted: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "世界") {
+		t.Errorf("CJK suffix corrupted: %q", result.RedactedText)
+	}
+	if !strings.Contains(result.RedactedText, "[EMAIL_1]") {
+		t.Errorf("expected [EMAIL_1] placeholder: %q", result.RedactedText)
+	}
+}
+
+func TestRedact_MultibyteEmoji_KeySymbol(t *testing.T) {
+	// Emoji 🔑 = 1 rune, 4 bytes. Ensure rune offsets work correctly.
+	text := "🔑 key: sk-abc123def456 🔑"
+	runes := []rune(text)
+	// "sk-abc123def456" starts at rune 7
+	keyStr := "sk-abc123def456"
+	keyStart := -1
+	for i := range runes {
+		if i+len([]rune(keyStr)) <= len(runes) && string(runes[i:i+len([]rune(keyStr))]) == keyStr {
+			keyStart = i
+			break
+		}
+	}
+	if keyStart == -1 {
+		t.Fatal("could not find key in emoji text")
+	}
+	keyEnd := keyStart + len([]rune(keyStr))
+
+	detections := makeDetections([]detSpec{
+		{EntityType: "API_KEY", MatchedText: keyStr, Start: keyStart, End: keyEnd},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if strings.Contains(result.RedactedText, "sk-abc123def456") {
+		t.Errorf("key still present: %q", result.RedactedText)
+	}
+	// Both emoji should survive
+	if strings.Count(result.RedactedText, "🔑") != 2 {
+		t.Errorf("emoji corrupted, expected 2 🔑, got: %q", result.RedactedText)
+	}
+}
+
+// ============================================================
+// LONG TEXT PERFORMANCE TEST
+// ============================================================
+
+func TestRedact_LongText_100KB(t *testing.T) {
+	// 100KB text with detections scattered throughout.
+	// Verify correctness and that it doesn't hang.
+	size := 100 * 1024
+	buf := make([]rune, size)
+	for i := range buf {
+		buf[i] = 'A' + rune(i%26)
+	}
+	text := string(buf)
+
+	// Place 15 detections at regular intervals.
+	var specs []detSpec
+	step := size / 16
+	for i := 0; i < 15; i++ {
+		start := step * (i + 1)
+		end := start + 5
+		if end > size {
+			break
+		}
+		specs = append(specs, detSpec{
+			EntityType:  "SSN",
+			MatchedText: string(buf[start : start+5]),
+			Start:       start,
+			End:         end,
+		})
+	}
+
+	detections := makeDetections(specs)
+	result := redactor.RedactFromScanResult(text, detections)
+
+	// Verify all detections were redacted.
+	ssnCount := strings.Count(result.RedactedText, "[SSN_")
+	if ssnCount != 15 {
+		t.Errorf("expected 15 [SSN_N] placeholders in 100KB text, got %d", ssnCount)
+	}
+}
+
+// ============================================================
+// EDGE CASES: start/end boundaries
+// ============================================================
+
+func TestRedact_SingleDetectionAtStart(t *testing.T) {
+	text := "SENSITIVE rest of text"
+	detections := makeDetections([]detSpec{
+		{EntityType: "SSN", MatchedText: "SENSITIVE", Start: 0, End: 9},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if !strings.HasPrefix(result.RedactedText, "[SSN_1]") {
+		t.Errorf("expected redaction at start, got: %q", result.RedactedText)
+	}
+	if !strings.HasSuffix(result.RedactedText, " rest of text") {
+		t.Errorf("suffix corrupted: %q", result.RedactedText)
+	}
+}
+
+func TestRedact_SingleDetectionAtEnd(t *testing.T) {
+	text := "prefix SENSITIVE"
+	detections := makeDetections([]detSpec{
+		{EntityType: "EMAIL", MatchedText: "SENSITIVE", Start: 7, End: 16},
+	})
+
+	result := redactor.RedactFromScanResult(text, detections)
+
+	if !strings.HasPrefix(result.RedactedText, "prefix ") {
+		t.Errorf("prefix corrupted: %q", result.RedactedText)
+	}
+	if !strings.HasSuffix(result.RedactedText, "[EMAIL_1]") {
+		t.Errorf("expected redaction at end, got: %q", result.RedactedText)
+	}
+}
+
 // makeDetections converts test specs to the anonymous struct type required by RedactFromScanResult.
 func makeDetections(specs []detSpec) []struct {
 	EntityType  string

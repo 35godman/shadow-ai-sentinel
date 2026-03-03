@@ -1,0 +1,6 @@
+{
+  "content": "Here is our deployment config: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY GITHUB_TOKEN=ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456 OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+  "contentType": "text",
+  "targetDomain": "chat.openai.com",
+  "targetUrl": "https://chat.openai.com/chat"
+}

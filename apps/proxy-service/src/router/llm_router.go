@@ -1,12 +1,14 @@
 package router
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -155,6 +157,157 @@ func (rt *Router) Forward(ctx context.Context, decision RouteDecision, req LLMRe
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", decision.Provider)
 	}
+}
+
+// ============================================================
+// STREAMING FORWARD — SSE pipe from LLM to client
+// ============================================================
+
+// RedactMapping mirrors redactor.Mapping for re-identification in streaming responses.
+type RedactMapping struct {
+	Placeholder string
+	Original    string
+}
+
+// ForwardStream sends a streaming request to the LLM and pipes SSE chunks
+// directly to the client writer. Performs re-identification on each chunk.
+//
+// Pre-scan enforcement must happen BEFORE calling this method.
+func (rt *Router) ForwardStream(ctx context.Context, decision RouteDecision, req LLMRequest, w io.Writer, flusher http.Flusher, mappings interface{}) error {
+	if req.Model != "" {
+		decision.Model = req.Model
+	}
+
+	// Build provider-specific streaming request.
+	var endpoint string
+	var body interface{}
+	var headers map[string]string
+
+	switch decision.Provider {
+	case "openai", "chatgpt":
+		messages := req.Messages
+		if len(messages) == 0 && req.Prompt != "" {
+			messages = []Message{{Role: "user", Content: req.Prompt}}
+		}
+		body = map[string]interface{}{
+			"model":       decision.Model,
+			"messages":    messages,
+			"max_tokens":  coalesce(req.MaxTokens, 2048),
+			"temperature": req.Temperature,
+			"stream":      true,
+		}
+		endpoint = decision.EndpointURL
+		headers = map[string]string{
+			"Authorization": "Bearer " + rt.cfg.OpenAIKey,
+		}
+	case "anthropic", "claude":
+		messages := req.Messages
+		if len(messages) == 0 && req.Prompt != "" {
+			messages = []Message{{Role: "user", Content: req.Prompt}}
+		}
+		body = map[string]interface{}{
+			"model":      decision.Model,
+			"messages":   messages,
+			"max_tokens": coalesce(req.MaxTokens, 2048),
+			"stream":     true,
+		}
+		endpoint = decision.EndpointURL
+		headers = map[string]string{
+			"x-api-key":         rt.cfg.AnthropicKey,
+			"anthropic-version": "2023-06-01",
+		}
+	case "ollama":
+		messages := req.Messages
+		if len(messages) == 0 && req.Prompt != "" {
+			messages = []Message{{Role: "user", Content: req.Prompt}}
+		}
+		body = map[string]interface{}{
+			"model":    decision.Model,
+			"messages": messages,
+			"stream":   true,
+		}
+		endpoint = decision.EndpointURL + "/api/chat"
+		headers = nil
+	default:
+		return fmt.Errorf("streaming not supported for provider: %s", decision.Provider)
+	}
+
+	// Make the streaming HTTP request.
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal stream request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBody))
+	if err != nil {
+		return fmt.Errorf("create stream request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := rt.cfg.HTTPClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("stream request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("stream HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Pipe SSE chunks from LLM to client.
+	// Re-identify placeholders in each chunk if mappings exist.
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Re-identify placeholders in data lines.
+		if strings.HasPrefix(line, "data: ") {
+			line = reidentifySSELine(line, mappings)
+		}
+
+		fmt.Fprintf(w, "%s\n", line)
+		flusher.Flush()
+	}
+
+	// Send final done event.
+	fmt.Fprintf(w, "data: {\"done\": true, \"routedTo\": %q}\n\n", decision.Target)
+	flusher.Flush()
+
+	return scanner.Err()
+}
+
+// reidentifySSELine replaces redaction placeholders in a streamed SSE data line.
+func reidentifySSELine(line string, mappingsRaw interface{}) string {
+	// Accept []RedactMapping or any slice of structs with Placeholder/Original.
+	type mapping interface {
+		GetPlaceholder() string
+		GetOriginal() string
+	}
+
+	// Try the common redactor.Mapping shape via JSON-compatible interface.
+	type simpleMapping struct {
+		Placeholder string
+		Original    string
+	}
+
+	// Use type assertion for the most common case.
+	switch m := mappingsRaw.(type) {
+	case []RedactMapping:
+		for _, rm := range m {
+			line = strings.ReplaceAll(line, rm.Placeholder, rm.Original)
+		}
+	case []simpleMapping:
+		for _, rm := range m {
+			line = strings.ReplaceAll(line, rm.Placeholder, rm.Original)
+		}
+	}
+	// If mappings are of an unknown type or nil, return line unchanged.
+	return line
 }
 
 // ============================================================

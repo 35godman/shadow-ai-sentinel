@@ -1,0 +1,6 @@
+{
+  "content": "Please help me write a summary of the quarterly earnings report. The company had strong performance in Q3 with revenue growth of 15% year over year.",
+  "contentType": "text",
+  "targetDomain": "chat.openai.com",
+  "targetUrl": "https://chat.openai.com/chat"
+}
