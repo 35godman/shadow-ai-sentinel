@@ -137,6 +137,13 @@ var Patterns = []Pattern{
 		Regex: regexp.MustCompile(`"private_key":\s*"-----BEGIN (?:RSA )?PRIVATE KEY-----`),
 		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
 	},
+	{
+		// Google/Gemini API key: AIza prefix followed by 35 alphanumeric/dash/underscore chars.
+		ID: "google-api-key", EntityType: "GCP_KEY", Name: "Google/Gemini API Key",
+		Regex:            regexp.MustCompile(`\b(AIza[A-Za-z0-9\-_]{35})\b`),
+		Validator:        highEntropy,
+		SensitivityLevel: "CRITICAL", ComplianceFrameworks: []string{"SOC2", "CIS"},
+	},
 
 	// --- PII ---
 	{

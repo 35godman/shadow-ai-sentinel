@@ -5,18 +5,20 @@
 // ============================================================
 
 import { scanText, redactText } from "@sentinel/regex-patterns";
-import type { PolicyAction, Detection } from "@sentinel/shared-types";
+import type { PolicyAction, Detection, EntityType } from "@sentinel/shared-types";
 
 // --- State ---
 let isEnabled = true;
 let learningMode = false; // Enforce by default — matches proxy and background defaults
+let enabledDetectors: EntityType[] = []; // Empty = all detectors active (no filtering)
 let lastScanResult: { action: PolicyAction; detections: Partial<Detection>[] } | null = null;
 
 // --- Load config from background on init ---
 chrome.runtime.sendMessage({ type: "GET_CONFIG" }, (config) => {
   if (config) {
-    isEnabled = true;
+    isEnabled = config.isEnabled ?? true;
     learningMode = config.learningMode ?? false;
+    enabledDetectors = config.enabledDetectors ?? [];
   }
 });
 
@@ -26,6 +28,7 @@ chrome.runtime.sendMessage({ type: "GET_CONFIG" }, (config) => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "CONFIG_UPDATE" && message.config) {
     learningMode = message.config.learningMode ?? false;
+    enabledDetectors = message.config.enabledDetectors ?? [];
   }
 });
 
@@ -45,7 +48,9 @@ document.addEventListener("paste", async (event: ClipboardEvent) => {
   // await the browser has already inserted the text and it's too late.
   // Do a fast local scan (<5ms) and make the enforcement decision NOW,
   // before yielding to any async operations.
-  const localResult = scanText(pastedText);
+  const localResult = scanText(pastedText, {
+    enabledTypes: enabledDetectors.length > 0 ? enabledDetectors : undefined,
+  });
   const localAction: PolicyAction = learningMode ? "LOG" : localResult.recommendedAction;
 
   let pasteWasPrevented = false;
@@ -187,7 +192,7 @@ document.addEventListener("drop", async (event: DragEvent) => {
         `File "${file.name}" blocked: contains ${result.detections.map(d => d.entityType).join(", ")}`,
         "error"
       );
-      return;
+      continue; // Scan all files — don't stop at the first blocked one
     }
 
     if (result.detections.length > 0) {
@@ -236,8 +241,32 @@ document.addEventListener("change", async (event: Event) => {
 
 document.addEventListener("submit", async (event: SubmitEvent) => {
   if (!isEnabled) return;
-  // Most AI tools use JS-driven submission, not form submit
-  // This catches edge cases
+
+  const form = event.target as HTMLFormElement;
+  if (!form) return;
+
+  const inputs = Array.from(
+    form.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
+      'input[type="text"], input[type="search"], textarea'
+    )
+  );
+  const combinedText = inputs.map(i => i.value).filter(Boolean).join(" ");
+  if (combinedText.length < 5) return;
+
+  // Synchronous scan — must call preventDefault before any await.
+  const localResult = scanText(combinedText, {
+    enabledTypes: enabledDetectors.length > 0 ? enabledDetectors : undefined,
+  });
+  const localAction: PolicyAction = learningMode ? "LOG" : localResult.recommendedAction;
+
+  if (localAction === "BLOCK") {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    showUserNotification(
+      `Form submission blocked: ${localResult.detections.map(d => d.entityType).join(", ")} detected`,
+      "error"
+    );
+  }
 }, true);
 
 // Also watch for Enter key in prompt inputs (most AI tools submit on Enter)
@@ -254,7 +283,9 @@ document.addEventListener("keydown", async (event: KeyboardEvent) => {
   // ── SYNCHRONOUS PHASE ───────────────────────────────────────
   // Same principle as paste: call preventDefault() synchronously based on
   // local scan before any await, otherwise the submission fires immediately.
-  const localResult = scanText(text);
+  const localResult = scanText(text, {
+    enabledTypes: enabledDetectors.length > 0 ? enabledDetectors : undefined,
+  });
   const localAction: PolicyAction = learningMode ? "LOG" : localResult.recommendedAction;
 
   let submissionWasBlocked = false;

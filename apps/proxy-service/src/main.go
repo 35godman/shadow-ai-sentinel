@@ -314,7 +314,8 @@ func handleScan(cfg Config) http.HandlerFunc {
 
 		// Step 2: ML service scan with circuit breaker + budget-controlled timeout.
 		// ML is non-blocking: if unavailable/circuit-open, regex results stand on their own.
-		if cfg.MLServiceURL != "" && !mlBreaker.IsOpen() {
+		// Skip ML entirely in learning mode — results are LOG-only so the extra latency is wasteful.
+		if cfg.MLServiceURL != "" && !mlBreaker.IsOpen() && !cfg.LearningMode {
 			mlCtx, mlCancel := budget.MLContext(r.Context())
 			mlStart := time.Now()
 			err := mlBreaker.Execute(func() error {
@@ -575,8 +576,17 @@ func handleProxyStreamChat(cfg Config, rt *llmrouter.Router) http.HandlerFunc {
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 
+		// Convert redactor.Mapping → llmrouter.RedactMapping so the router's
+		// reidentifySSELine type switch matches and restores PII placeholders in
+		// each streamed chunk. Without this conversion the type switch falls through
+		// to the default case and placeholders leak to the client unchanged.
+		routerMappings := make([]llmrouter.RedactMapping, len(redactMappings))
+		for i, m := range redactMappings {
+			routerMappings[i] = llmrouter.RedactMapping{Placeholder: m.Placeholder, Original: m.Original}
+		}
+
 		// Use ForwardStream to pipe the response from the LLM.
-		err := rt.ForwardStream(r.Context(), decision, llmReq, w, flusher, redactMappings)
+		err := rt.ForwardStream(r.Context(), decision, llmReq, w, flusher, routerMappings)
 		if err != nil {
 			// Can't send HTTP error after headers flushed — send SSE error event.
 			fmt.Fprintf(w, "data: {\"error\": %q, \"done\": true}\n\n", err.Error())
@@ -870,9 +880,11 @@ func jsonResponse(w http.ResponseWriter, data interface{}, status int) {
 func jsonError(w http.ResponseWriter, message string, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"error": map[string]string{"message": message},
-	})
+	}); err != nil {
+		slog.Error("jsonError encode failed", "error", err, "message", message, "status", status)
+	}
 }
 
 func getEnv(key, fallback string) string {
