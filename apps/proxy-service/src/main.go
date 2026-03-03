@@ -20,7 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,6 +32,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/shadow-ai-sentinel/proxy-service/src/circuitbreaker"
 	sentinelmw "github.com/shadow-ai-sentinel/proxy-service/src/middleware"
 	"github.com/shadow-ai-sentinel/proxy-service/src/policy"
 	"github.com/shadow-ai-sentinel/proxy-service/src/redactor"
@@ -97,6 +98,10 @@ func loadConfig() Config {
 func main() {
 	cfg := loadConfig()
 
+	// Initialize circuit breaker for ML service.
+	// Threshold=3 consecutive failures → OPEN, 2 successes in HALF_OPEN → CLOSED, 30s recovery.
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+
 	// Initialize LLM router once — reused across all /proxy/chat requests.
 	llmRouter := llmrouter.NewRouter(llmrouter.RouterConfig{
 		OpenAIKey:    cfg.OpenAIKey,
@@ -156,6 +161,7 @@ func main() {
 			r.Use(sentinelmw.APIKeyAuth(makeOrgLookup(cfg)))
 		}
 		r.Post("/chat", handleProxyChat(cfg, llmRouter))
+		r.Post("/stream/chat", handleProxyStreamChat(cfg, llmRouter))
 	})
 
 	srv := &http.Server{
@@ -167,10 +173,12 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("[Sentinel] Starting proxy on :%s env=%s onprem=%v learning_mode=%v",
-			cfg.Port, cfg.Environment, cfg.OnPremMode, cfg.LearningMode)
+		slog.Info("starting proxy",
+			"port", cfg.Port, "env", cfg.Environment,
+			"onprem", cfg.OnPremMode, "learning_mode", cfg.LearningMode)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[Sentinel] Server error: %v", err)
+			slog.Error("server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -178,11 +186,11 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("[Sentinel] Shutting down gracefully...")
+	slog.Info("shutting down gracefully")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("[Sentinel] Shutdown error: %v", err)
+		slog.Error("shutdown error", "error", err)
 	}
 }
 
@@ -205,12 +213,43 @@ func makeOrgLookup(cfg Config) sentinelmw.OrgLookupFunc {
 
 func handleHealth(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		mlStatus := "unconfigured"
+		cbState := "N/A"
+
+		if cfg.MLServiceURL != "" && mlBreaker != nil {
+			cbState = mlBreaker.State().String()
+			if mlBreaker.IsOpen() {
+				mlStatus = "circuit_open"
+			} else {
+				// Quick probe with 1s timeout
+				pingCtx, cancel := context.WithTimeout(r.Context(), time.Second)
+				_, err := callMLServiceCtx(pingCtx, cfg.MLServiceURL, "health-check")
+				cancel()
+				if err != nil {
+					mlStatus = "unavailable"
+				} else {
+					mlStatus = "healthy"
+				}
+			}
+		}
+
+		overallStatus := "healthy"
+		if mlStatus == "unavailable" || mlStatus == "circuit_open" {
+			overallStatus = "degraded"
+		}
+
 		jsonResponse(w, map[string]interface{}{
-			"status":        "healthy",
+			"status":        overallStatus,
 			"version":       "0.3.0",
 			"onprem":        cfg.OnPremMode,
 			"learning_mode": cfg.LearningMode,
-			"ml_service":    cfg.MLServiceURL,
+			"services": map[string]interface{}{
+				"ml_service": map[string]string{
+					"status":        mlStatus,
+					"circuit_state": cbState,
+					"url":           cfg.MLServiceURL,
+				},
+			},
 		}, http.StatusOK)
 	}
 }
@@ -235,12 +274,13 @@ type scanRequest struct {
 // scanResponse is the outbound shape the extension expects.
 // Must match TypeScript: { action, detections, combinedRisk, userMessage?, redactedContent? }
 type scanResponse struct {
-	Action           string             `json:"action"`
-	Detections       []scanner.Detection `json:"detections"`
-	CombinedRisk     string             `json:"combinedRisk"`
-	ScanDurationMs   float64            `json:"scanDurationMs"`
-	UserMessage      string             `json:"userMessage,omitempty"`
-	RedactedContent  string             `json:"redactedContent,omitempty"`
+	Action          string              `json:"action"`
+	Detections      []scanner.Detection `json:"detections"`
+	CombinedRisk    string              `json:"combinedRisk"`
+	ScanDurationMs  float64             `json:"scanDurationMs"`
+	UserMessage     string              `json:"userMessage,omitempty"`
+	RedactedContent string              `json:"redactedContent,omitempty"`
+	Degraded        bool                `json:"degraded,omitempty"`
 }
 
 func handleScan(cfg Config) http.HandlerFunc {
@@ -261,7 +301,10 @@ func handleScan(cfg Config) http.HandlerFunc {
 			return
 		}
 
-		// Step 1: Server-side regex scan (always runs, <5ms)
+		// Deterministic timeout budget: regex (100ms) + ML (3s) within 10s total.
+		budget := scanner.DefaultBudget()
+
+		// Step 1: Server-side regex scan (always runs, <5ms typical)
 		scanResult := scanner.ScanText(req.Content, nil)
 
 		// Ensure detections is always a JSON array, never null.
@@ -269,16 +312,38 @@ func handleScan(cfg Config) http.HandlerFunc {
 			scanResult.Detections = make([]scanner.Detection, 0)
 		}
 
-		// Step 2: Optional ML service scan (additive — does not replace regex)
-		// ML is non-blocking: if unavailable, regex results stand on their own.
-		if cfg.MLServiceURL != "" {
-			mlDetections := callMLService(cfg.MLServiceURL, req.Content)
-			if len(mlDetections) > 0 {
-				scanResult = scanner.MergeMLDetections(scanResult, mlDetections)
-				log.Printf("[Sentinel] ML: merged %d detections domain=%s new_risk=%s",
-					len(mlDetections), req.TargetDomain, scanResult.CombinedRisk)
+		// Step 2: ML service scan with circuit breaker + budget-controlled timeout.
+		// ML is non-blocking: if unavailable/circuit-open, regex results stand on their own.
+		if cfg.MLServiceURL != "" && !mlBreaker.IsOpen() {
+			mlCtx, mlCancel := budget.MLContext(r.Context())
+			mlStart := time.Now()
+			err := mlBreaker.Execute(func() error {
+				mlDets, err := callMLServiceCtx(mlCtx, cfg.MLServiceURL, req.Content)
+				if err != nil {
+					return err
+				}
+				if len(mlDets) > 0 {
+					scanResult = scanner.FuseMLDetections(scanResult, mlDets)
+					slog.Info("ML fusion complete",
+						"detections", len(mlDets),
+						"domain", req.TargetDomain,
+						"risk", scanResult.CombinedRisk)
+				}
+				return nil
+			})
+			mlCancel()
+			mlDur := time.Since(mlStart).Seconds() * 1000
+			scanResult.MlDurationMs = &mlDur
+			if err != nil {
+				budget.MarkMLDegraded()
+				slog.Warn("ML service degraded", "error", err, "circuit", mlBreaker.State().String())
 			}
+		} else if cfg.MLServiceURL != "" && mlBreaker.IsOpen() {
+			budget.MarkMLDegraded()
+			slog.Warn("ML circuit open, skipping", "circuit", mlBreaker.State().String())
 		}
+
+		scanResult.Degraded = budget.Degraded()
 
 		// Step 3: Policy engine evaluation
 		// Phase 1: no org-specific rules (DB not wired). Scanner's action is the default.
@@ -305,6 +370,7 @@ func handleScan(cfg Config) http.HandlerFunc {
 			CombinedRisk:   scanResult.CombinedRisk,
 			ScanDurationMs: scanResult.ScanDurationMs,
 			UserMessage:    buildUserMessage(action, entityTypes, cfg.LearningMode),
+			Degraded:       scanResult.Degraded,
 		}
 
 		// Step 5: If REDACT, produce the cleaned content for the extension to use.
@@ -314,9 +380,10 @@ func handleScan(cfg Config) http.HandlerFunc {
 			resp.RedactedContent = redactResult.RedactedText
 		}
 
-		log.Printf("[Sentinel] scan: domain=%s action=%s risk=%s detections=%d duration=%.2fms",
-			req.TargetDomain, action, scanResult.CombinedRisk,
-			len(scanResult.Detections), scanResult.ScanDurationMs)
+		slog.Info("scan complete",
+			"domain", req.TargetDomain, "action", action,
+			"risk", scanResult.CombinedRisk, "detections", len(scanResult.Detections),
+			"duration_ms", scanResult.ScanDurationMs, "degraded", scanResult.Degraded)
 
 		jsonResponse(w, resp, http.StatusOK)
 	}
@@ -376,8 +443,8 @@ func handleProxyChat(cfg Config, rt *llmrouter.Router) http.HandlerFunc {
 
 		// Step 3: Hard block — reject before any data leaves
 		if action == "BLOCK" {
-			log.Printf("[Sentinel] /proxy/chat BLOCKED provider=%s risk=%s types=%v",
-				req.Provider, combinedScan.CombinedRisk, entityTypes)
+			slog.Warn("proxy chat BLOCKED",
+				"provider", req.Provider, "risk", combinedScan.CombinedRisk, "types", entityTypes)
 			jsonError(w, fmt.Sprintf(
 				"Request blocked: %s detected (%s risk). Sensitive data cannot be forwarded to AI providers.",
 				strings.Join(entityTypes, ", "), combinedScan.CombinedRisk,
@@ -400,7 +467,7 @@ func handleProxyChat(cfg Config, rt *llmrouter.Router) http.HandlerFunc {
 
 		llmResp, err := rt.Forward(r.Context(), decision, llmReq)
 		if err != nil {
-			log.Printf("[Sentinel] LLM forward error provider=%s: %v", req.Provider, err)
+			slog.Error("LLM forward error", "provider", req.Provider, "error", err)
 			jsonError(w, fmt.Sprintf("LLM request failed: %v", err), http.StatusBadGateway)
 			return
 		}
@@ -411,14 +478,14 @@ func handleProxyChat(cfg Config, rt *llmrouter.Router) http.HandlerFunc {
 		if len(redactMappings) > 0 {
 			leaked := redactor.ScanResponseForHallucinatedPII(responseContent, redactMappings)
 			if len(leaked) > 0 {
-				log.Printf("[Sentinel] WARNING: LLM response contains hallucinated PII types=%v provider=%s",
-					leaked, req.Provider)
+				slog.Warn("LLM hallucinated PII in response", "types", leaked, "provider", req.Provider)
 			}
 			responseContent = redactor.ReIdentify(responseContent, redactMappings)
 		}
 
-		log.Printf("[Sentinel] /proxy/chat: provider=%s model=%s action=%s routed_to=%s tokens=%d",
-			req.Provider, llmResp.Model, action, llmResp.RoutedTo, llmResp.TokensUsed)
+		slog.Info("proxy chat complete",
+			"provider", req.Provider, "model", llmResp.Model,
+			"action", action, "routed_to", llmResp.RoutedTo, "tokens", llmResp.TokensUsed)
 
 		jsonResponse(w, map[string]interface{}{
 			"content":    responseContent,
@@ -428,6 +495,98 @@ func handleProxyChat(cfg Config, rt *llmrouter.Router) http.HandlerFunc {
 			"routedTo":   llmResp.RoutedTo,
 			"action":     action,
 		}, http.StatusOK)
+	}
+}
+
+// ============================================================
+// STREAMING PROXY — Scan → Redact → Stream Response
+// POST /proxy/stream/chat
+//
+// Same pre-scan enforcement as /proxy/chat, but streams the LLM
+// response as Server-Sent Events. BLOCK → 403 before any streaming.
+// ============================================================
+
+func handleProxyStreamChat(cfg Config, rt *llmrouter.Router) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Provider string        `json:"provider"`
+			Model    string        `json:"model"`
+			Messages []chatMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonError(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if len(req.Messages) == 0 {
+			jsonError(w, "No messages provided", http.StatusBadRequest)
+			return
+		}
+
+		// Step 1: Pre-scan all messages — REQUIRED, cannot be bypassed.
+		combinedScan := scanMessages(req.Messages)
+		entityTypes := uniqueEntityTypes(combinedScan.Detections)
+		policyCtx := policy.EvalContext{
+			EntityTypes:   entityTypes,
+			AiTool:        req.Provider,
+			Sensitivity:   combinedScan.CombinedRisk,
+			MaxConfidence: maxConfidence(combinedScan.Detections),
+		}
+		evalResult := policy.Evaluate([]policy.Rule{}, policyCtx, combinedScan.RecommendedAction)
+		action := evalResult.Action
+
+		if cfg.LearningMode {
+			action = "LOG"
+		}
+
+		// Step 2: BLOCK → 403 before streaming starts.
+		if action == "BLOCK" {
+			slog.Warn("stream chat BLOCKED",
+				"provider", req.Provider, "risk", combinedScan.CombinedRisk, "types", entityTypes)
+			jsonError(w, fmt.Sprintf(
+				"Request blocked: %s detected (%s risk). Sensitive data cannot be forwarded.",
+				strings.Join(entityTypes, ", "), combinedScan.CombinedRisk,
+			), http.StatusForbidden)
+			return
+		}
+
+		// Step 3: Redact messages if needed.
+		routerMessages, redactMappings := buildRouterMessages(req.Messages, action)
+
+		// Step 4: Route decision.
+		decision := rt.Decide(combinedScan.CombinedRisk, req.Provider, "")
+		llmReq := llmrouter.LLMRequest{
+			Provider: req.Provider,
+			Model:    req.Model,
+			Messages: routerMessages,
+			Stream:   true,
+		}
+
+		// Step 5: Forward streaming request to LLM.
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			jsonError(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+
+		// Use ForwardStream to pipe the response from the LLM.
+		err := rt.ForwardStream(r.Context(), decision, llmReq, w, flusher, redactMappings)
+		if err != nil {
+			// Can't send HTTP error after headers flushed — send SSE error event.
+			fmt.Fprintf(w, "data: {\"error\": %q, \"done\": true}\n\n", err.Error())
+			flusher.Flush()
+			slog.Error("stream forward error", "provider", req.Provider, "error", err)
+			return
+		}
+
+		slog.Info("stream chat complete",
+			"provider", req.Provider, "action", action, "routed_to", decision.Target)
 	}
 }
 
@@ -544,37 +703,63 @@ func buildUserMessage(action string, entityTypes []string, learningMode bool) st
 // ML SERVICE CLIENT (optional, additive)
 // ============================================================
 
-func callMLService(mlURL, text string) []map[string]interface{} {
+// mlHTTPClient is a shared, pooled HTTP client for ML service calls.
+// Created once — no per-request allocation. Timeout is controlled by
+// the caller's context (from the Budget), not by client.Timeout.
+var mlHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// mlBreaker protects the ML service from cascading failures.
+// Initialized in main(). Safe for concurrent use.
+var mlBreaker *circuitbreaker.CircuitBreaker
+
+// callMLServiceCtx calls the ML classify endpoint with a context-controlled timeout.
+// Returns the parsed detections or an error (for circuit breaker recording).
+func callMLServiceCtx(ctx context.Context, mlURL, text string) ([]map[string]interface{}, error) {
 	body, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("marshal ML request: %w", err)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(mlURL+"/api/v1/classify", "application/json",
+	req, err := http.NewRequestWithContext(ctx, "POST", mlURL+"/api/v1/classify",
 		strings.NewReader(string(body)))
 	if err != nil {
-		// ML service is optional — absence is not an error
-		return nil
+		return nil, fmt.Errorf("create ML request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := mlHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ML service request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
+		io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("ML service status %d", resp.StatusCode)
 	}
 
 	var mlResp struct {
 		Detections []map[string]interface{} `json:"detections"`
 	}
-	if err := json.Unmarshal(respBody, &mlResp); err != nil {
-		return nil
+	if err := json.NewDecoder(resp.Body).Decode(&mlResp); err != nil {
+		return nil, fmt.Errorf("decode ML response: %w", err)
 	}
-	return mlResp.Detections
+	return mlResp.Detections, nil
+}
+
+// callMLService is the legacy wrapper (no context, no error).
+// Kept for backward compatibility with tests.
+func callMLService(mlURL, text string) []map[string]interface{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dets, _ := callMLServiceCtx(ctx, mlURL, text)
+	return dets
 }
 
 // ============================================================
@@ -595,8 +780,8 @@ func handleEventBatch() http.HandlerFunc {
 			return
 		}
 
-		log.Printf("[Sentinel] Event batch: audit=%d shadow_ai=%d",
-			len(batch.AuditEvents), len(batch.ShadowAiEvents))
+		slog.Info("event batch received",
+			"audit_events", len(batch.AuditEvents), "shadow_ai_events", len(batch.ShadowAiEvents))
 
 		// Phase 2: persist via store.InsertAuditEventBatch(ctx, events)
 		w.WriteHeader(http.StatusAccepted)
@@ -678,7 +863,7 @@ func jsonResponse(w http.ResponseWriter, data interface{}, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("[Sentinel] jsonResponse encode error: %v", err)
+		slog.Error("jsonResponse encode error", "error", err)
 	}
 }
 

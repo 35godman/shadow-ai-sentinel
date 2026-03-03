@@ -16,10 +16,16 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/shadow-ai-sentinel/proxy-service/src/circuitbreaker"
+	llmrouter "github.com/shadow-ai-sentinel/proxy-service/src/router"
 )
 
 // ============================================================
@@ -427,5 +433,210 @@ func TestBuildUserMessage_NoDetections_Empty(t *testing.T) {
 	if msg != "" {
 		t.Errorf("expected empty message for no detections, got %q", msg)
 	}
+}
+
+// ============================================================
+// ML CIRCUIT BREAKER + DEGRADED MODE
+// ============================================================
+
+func TestHandleScan_MLCircuitOpen_Degraded(t *testing.T) {
+	// Initialize mlBreaker and simulate an open circuit.
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(1, 1, time.Hour) // 1 failure → OPEN, long timeout
+	mlBreaker.RecordFailure()                        // trip it
+	defer func() { mlBreaker = oldBreaker }()
+
+	cfg := testConfig(false)
+	cfg.MLServiceURL = "http://fake-ml:9999" // configured but circuit is open
+
+	handler := handleScan(cfg)
+	w := postJSON(t, handler, `{
+		"content":      "My SSN is 078-05-1120",
+		"targetDomain": "chatgpt.com"
+	}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := decodeBody(t, w)
+
+	// Should still work (regex-only) but be degraded.
+	if scanAction(t, body) != "BLOCK" {
+		t.Errorf("expected BLOCK (regex-only), got %q", scanAction(t, body))
+	}
+	degraded, _ := body["degraded"].(bool)
+	if !degraded {
+		t.Errorf("expected degraded=true when ML circuit is open, got %v", body["degraded"])
+	}
+}
+
+func TestHandleScan_NoML_NotDegraded(t *testing.T) {
+	// When ML is not configured, degraded should be false.
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+	defer func() { mlBreaker = oldBreaker }()
+
+	handler := handleScan(testConfig(false))
+	w := postJSON(t, handler, `{
+		"content":      "Clean text, no PII",
+		"targetDomain": "chatgpt.com"
+	}`)
+
+	body := decodeBody(t, w)
+	degraded, _ := body["degraded"].(bool)
+	if degraded {
+		t.Errorf("expected degraded=false when ML is not configured")
+	}
+}
+
+// ============================================================
+// HEALTH ENDPOINT — circuit breaker awareness
+// ============================================================
+
+func TestHandleHealth_MLUnconfigured(t *testing.T) {
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+	defer func() { mlBreaker = oldBreaker }()
+
+	cfg := testConfig(false)
+	cfg.MLServiceURL = "" // no ML
+
+	handler := handleHealth(cfg)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := decodeBody(t, w)
+	if body["status"] != "healthy" {
+		t.Errorf("expected healthy when ML unconfigured, got %v", body["status"])
+	}
+
+	services, _ := body["services"].(map[string]interface{})
+	ml, _ := services["ml_service"].(map[string]interface{})
+	if ml["status"] != "unconfigured" {
+		t.Errorf("expected ml_service status=unconfigured, got %v", ml["status"])
+	}
+}
+
+func TestHandleHealth_MLCircuitOpen(t *testing.T) {
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(1, 1, time.Hour)
+	mlBreaker.RecordFailure() // trip it
+	defer func() { mlBreaker = oldBreaker }()
+
+	cfg := testConfig(false)
+	cfg.MLServiceURL = "http://fake-ml:9999"
+
+	handler := handleHealth(cfg)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	body := decodeBody(t, w)
+	if body["status"] != "degraded" {
+		t.Errorf("expected degraded status when circuit open, got %v", body["status"])
+	}
+
+	services, _ := body["services"].(map[string]interface{})
+	ml, _ := services["ml_service"].(map[string]interface{})
+	if ml["status"] != "circuit_open" {
+		t.Errorf("expected ml_service status=circuit_open, got %v", ml["status"])
+	}
+	if ml["circuit_state"] != "OPEN" {
+		t.Errorf("expected circuit_state=OPEN, got %v", ml["circuit_state"])
+	}
+}
+
+// ============================================================
+// STREAMING ENDPOINT — pre-scan enforcement
+// ============================================================
+
+func TestHandleProxyStreamChat_Block(t *testing.T) {
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+	defer func() { mlBreaker = oldBreaker }()
+
+	cfg := testConfig(false)
+	handler := handleProxyStreamChat(cfg, nil) // nil router — should block before routing
+
+	w := postJSON(t, handler, `{
+		"provider": "openai",
+		"messages": [{"role": "user", "content": "My SSN is 078-05-1120"}]
+	}`)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for BLOCK in stream, got %d", w.Code)
+	}
+}
+
+func TestHandleProxyStreamChat_EmptyMessages_400(t *testing.T) {
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+	defer func() { mlBreaker = oldBreaker }()
+
+	handler := handleProxyStreamChat(testConfig(false), nil)
+	w := postJSON(t, handler, `{"provider": "openai", "messages": []}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty messages, got %d", w.Code)
+	}
+}
+
+func TestHandleProxyStreamChat_LearningMode_NoBlock(t *testing.T) {
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+	defer func() { mlBreaker = oldBreaker }()
+
+	cfg := testConfig(true) // learning mode
+	// Provide a real (but unconfigured) router so we don't nil-deref.
+	rt := llmrouter.NewRouter(llmrouter.RouterConfig{})
+	handler := handleProxyStreamChat(cfg, rt)
+
+	// SSN would normally BLOCK, but learning mode should prevent it.
+	// The router will fail at the streaming step, not at BLOCK.
+	w := postJSON(t, handler, `{
+		"provider": "openai",
+		"messages": [{"role": "user", "content": "My SSN is 078-05-1120"}]
+	}`)
+
+	// In learning mode, action becomes LOG, so it should NOT return 403.
+	// It will fail downstream (no API key → SSE error), but that's ok.
+	if w.Code == http.StatusForbidden {
+		t.Error("learning mode should prevent BLOCK on streaming endpoint")
+	}
+}
+
+// ============================================================
+// CONCURRENT HANDLER SAFETY (go test -race)
+// ============================================================
+
+func TestHandleScan_ConcurrentSafety(t *testing.T) {
+	oldBreaker := mlBreaker
+	mlBreaker = circuitbreaker.New(3, 2, 30*time.Second)
+	defer func() { mlBreaker = oldBreaker }()
+
+	handler := handleScan(testConfig(false))
+	var wg sync.WaitGroup
+	const goroutines = 50
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			content := "Clean text with no PII"
+			if n%3 == 0 {
+				content = "My SSN is 078-05-1120"
+			} else if n%3 == 1 {
+				content = "Email: alice@example.com"
+			}
+			body := fmt.Sprintf(`{"content": %q, "targetDomain": "chatgpt.com"}`, content)
+			w := postJSON(t, handler, body)
+			if w.Code != http.StatusOK {
+				t.Errorf("goroutine %d: expected 200, got %d", n, w.Code)
+			}
+		}(i)
+	}
+
+	wg.Wait()
 }
 

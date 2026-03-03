@@ -27,12 +27,13 @@ type Detection struct {
 }
 
 type ScanResult struct {
-	Detections      []Detection `json:"detections"`
-	CombinedRisk    string      `json:"combinedRiskScore"`
-	RecommendedAction string   `json:"recommendedAction"`
-	ScanDurationMs  float64     `json:"scanDurationMs"`
-	RegexDurationMs float64     `json:"regexDurationMs"`
-	MlDurationMs    *float64    `json:"mlDurationMs,omitempty"`
+	Detections        []Detection `json:"detections"`
+	CombinedRisk      string      `json:"combinedRiskScore"`
+	RecommendedAction string      `json:"recommendedAction"`
+	ScanDurationMs    float64     `json:"scanDurationMs"`
+	RegexDurationMs   float64     `json:"regexDurationMs"`
+	MlDurationMs      *float64    `json:"mlDurationMs,omitempty"`
+	Degraded          bool        `json:"degraded,omitempty"` // true when ML was skipped (circuit open / budget exhausted)
 }
 
 // ============================================================
@@ -295,7 +296,7 @@ func ScanText(text string, enabledTypes []string) ScanResult {
 	elapsed := time.Since(start).Seconds() * 1000
 
 	combinedRisk := determineCombinedRisk(detections)
-	action := determineAction(combinedRisk)
+	action := DetermineAction(combinedRisk)
 
 	return ScanResult{
 		Detections:        detections,
@@ -422,64 +423,161 @@ func awsSecretValidator(match string) bool {
 }
 
 // ============================================================
-// ML DETECTION MERGE
+// PROBABILISTIC FUSION — Bayesian ML + Regex Combination
 // ============================================================
 
-// MergeMLDetections adds non-overlapping ML detections into a regex scan result
-// and re-computes combined risk and recommended action.
-func MergeMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanResult {
+// entityFusionWeights maps entity types to [regexWeight, mlWeight].
+// Weights calibrate each source's reliability per entity class.
+//   - Structured entities (SSN, CC): regex is highly precise (Luhn, validators)
+//   - Unstructured entities (PERSON, ORG): ML (spaCy NER) is authoritative
+//   - Default: balanced trust in both sources
+var entityFusionWeights = map[string][2]float64{
+	"SSN":               {1.0, 0.6},
+	"CREDIT_CARD":       {1.0, 0.6},
+	"AWS_KEY":           {1.0, 0.4},
+	"GCP_KEY":           {1.0, 0.4},
+	"API_KEY":           {1.0, 0.4},
+	"PERSON":            {0.5, 1.0},
+	"ORGANIZATION":      {0.4, 1.0},
+	"LOCATION":          {0.4, 1.0},
+	"MEDICAL_CONDITION": {0.3, 1.0},
+	"DIAGNOSIS":         {0.3, 1.0},
+	"MEDICAL_ID":        {0.8, 0.9},
+	"EMAIL":             {0.9, 0.7},
+	"PHONE":             {0.8, 0.7},
+	"IP_ADDRESS":        {0.9, 0.5},
+	"IBAN":              {0.9, 0.6},
+	"FINANCIAL_ACCOUNT": {0.9, 0.6},
+	"CREDENTIALS":       {1.0, 0.5},
+	"SOURCE_CODE":       {0.8, 0.6},
+}
+
+var defaultFusionWeights = [2]float64{0.8, 0.8}
+
+// FuseConfidence combines regex and ML confidence using weighted Naïve Bayes
+// independence assumption:
+//
+//	P_combined = 1 − (1 − w_regex × P_regex) × (1 − w_ml × P_ml)
+//
+// This is mathematically correct under the assumption that regex and ML are
+// independent detectors. The weights calibrate each source's reliability.
+func FuseConfidence(regexConf, mlConf float64, entityType string) float64 {
+	w := entityFusionWeights[entityType]
+	if w == [2]float64{} {
+		w = defaultFusionWeights
+	}
+	combined := 1.0 - (1.0-w[0]*regexConf)*(1.0-w[1]*mlConf)
+	if combined > 1.0 {
+		combined = 1.0
+	}
+	return combined
+}
+
+// parseMLDetection extracts fields from a raw ML detection map.
+func parseMLDetection(raw map[string]interface{}) (entityType string, start, end int, confidence float64, riskScore, matchedText, redactedText string) {
+	entityType, _ = raw["entity_type"].(string)
+	matchedText, _ = raw["text"].(string)
+	startRaw, _ := raw["start"].(float64)
+	endRaw, _ := raw["end"].(float64)
+	confidence, _ = raw["confidence"].(float64)
+	riskScore, _ = raw["context_risk_score"].(string)
+	redactedText, _ = raw["redacted_text"].(string)
+
+	start = int(startRaw)
+	end = int(endRaw)
+
+	if riskScore == "" {
+		riskScore = "MEDIUM"
+	}
+	if redactedText == "" && entityType != "" {
+		redactedText = "[" + entityType + "_REDACTED]"
+	}
+	return
+}
+
+// sensitivityRank returns a numeric rank for risk levels (higher = more severe).
+func sensitivityRank(level string) int {
+	switch strings.ToUpper(level) {
+	case "CRITICAL":
+		return 4
+	case "HIGH":
+		return 3
+	case "MEDIUM":
+		return 2
+	case "LOW":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// FuseMLDetections performs probabilistic fusion of regex and ML results.
+//
+// For overlapping detections of the same entity type:
+//   - Combines confidences using weighted Naïve Bayes
+//   - Sets Source to "COMBINED"
+//   - Takes the higher risk score
+//
+// For non-overlapping ML detections: added as ML-source with original confidence.
+//
+// This replaces the old MergeMLDetections which simply discarded overlapping ML results.
+func FuseMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanResult {
 	for _, raw := range mlDets {
-		entityType, _ := raw["entity_type"].(string)
-		matchedText, _ := raw["text"].(string)
-		startRaw, _ := raw["start"].(float64)
-		endRaw, _ := raw["end"].(float64)
-		confidence, _ := raw["confidence"].(float64)
-		riskScore, _ := raw["context_risk_score"].(string)
-		redactedText, _ := raw["redacted_text"].(string)
-
-		start := int(startRaw)
-		end := int(endRaw)
-
+		entityType, start, end, mlConf, riskScore, matchedText, redactedText := parseMLDetection(raw)
 		if entityType == "" {
 			continue
 		}
-		if riskScore == "" {
-			riskScore = "MEDIUM"
-		}
-		if redactedText == "" {
-			redactedText = "[" + entityType + "_REDACTED]"
-		}
 
-		// Skip if overlapping with any existing regex detection.
-		overlaps := false
-		for _, existing := range base.Detections {
+		// Find overlapping regex detection of the same entity type
+		overlapIdx := -1
+		for i, existing := range base.Detections {
 			if start < existing.EndOffset && end > existing.StartOffset {
-				overlaps = true
+				// Same entity type → fuse; different entity type → add separately
+				if strings.EqualFold(existing.EntityType, entityType) {
+					overlapIdx = i
+				}
 				break
 			}
 		}
-		if overlaps {
-			continue
-		}
 
-		base.Detections = append(base.Detections, Detection{
-			ID:               fmt.Sprintf("ml-%s-%d", entityType, start),
-			EntityType:       entityType,
-			Confidence:       confidence,
-			Source:           "ML",
-			MatchedText:      matchedText,
-			RedactedText:     redactedText,
-			ContextRiskScore: riskScore,
-			StartOffset:      start,
-			EndOffset:        end,
-		})
+		if overlapIdx >= 0 {
+			// FUSION: combine confidences using weighted Naïve Bayes
+			regexConf := base.Detections[overlapIdx].Confidence
+			combined := FuseConfidence(regexConf, mlConf, entityType)
+			base.Detections[overlapIdx].Confidence = combined
+			base.Detections[overlapIdx].Source = "COMBINED"
+
+			// Take the higher risk score
+			if sensitivityRank(riskScore) > sensitivityRank(base.Detections[overlapIdx].ContextRiskScore) {
+				base.Detections[overlapIdx].ContextRiskScore = riskScore
+			}
+		} else {
+			// Non-overlapping: add ML detection as new entry
+			base.Detections = append(base.Detections, Detection{
+				ID:               fmt.Sprintf("ml-%s-%d", entityType, start),
+				EntityType:       entityType,
+				Confidence:       mlConf,
+				Source:           "ML",
+				MatchedText:      matchedText,
+				RedactedText:     redactedText,
+				ContextRiskScore: riskScore,
+				StartOffset:      start,
+				EndOffset:        end,
+			})
+		}
 	}
 
-	// Re-compute risk and action after adding ML detections.
+	// Re-compute risk and action after fusion.
 	base.CombinedRisk = determineCombinedRisk(base.Detections)
-	base.RecommendedAction = determineAction(base.CombinedRisk)
+	base.RecommendedAction = DetermineAction(base.CombinedRisk)
 
 	return base
+}
+
+// MergeMLDetections is kept for backward compatibility with existing callers.
+// New code should use FuseMLDetections.
+func MergeMLDetections(base ScanResult, mlDets []map[string]interface{}) ScanResult {
+	return FuseMLDetections(base, mlDets)
 }
 
 // ============================================================
@@ -508,7 +606,8 @@ func determineCombinedRisk(detections []Detection) string {
 	return "LOW"
 }
 
-func determineAction(risk string) string {
+// DetermineAction maps a combined risk level to a policy action.
+func DetermineAction(risk string) string {
 	switch risk {
 	case "CRITICAL":
 		return "BLOCK"

@@ -435,6 +435,146 @@ func TestEvaluate_NoMatch_NotifyFlagsFalse(t *testing.T) {
 }
 
 // ============================================================
+// ALL ACTION TYPES — explicit coverage
+// ============================================================
+
+func TestEvaluate_ActionBlock_FromRule(t *testing.T) {
+	rules := []policy.Rule{
+		{ID: "block-ssn", Action: "BLOCK", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "SSN"},
+		}},
+	}
+	ctx := policy.EvalContext{EntityTypes: []string{"SSN"}, Sensitivity: "CRITICAL"}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	if result.Action != "BLOCK" {
+		t.Errorf("expected BLOCK, got %s", result.Action)
+	}
+}
+
+func TestEvaluate_ActionRedact_FromRule(t *testing.T) {
+	rules := []policy.Rule{
+		{ID: "redact-email", Action: "REDACT", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "EMAIL"},
+		}},
+	}
+	ctx := policy.EvalContext{EntityTypes: []string{"EMAIL"}, Sensitivity: "MEDIUM"}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	if result.Action != "REDACT" {
+		t.Errorf("expected REDACT, got %s", result.Action)
+	}
+}
+
+func TestEvaluate_ActionWarn_FromRule(t *testing.T) {
+	rules := []policy.Rule{
+		{ID: "warn-code", Action: "WARN", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "SOURCE_CODE"},
+		}},
+	}
+	ctx := policy.EvalContext{EntityTypes: []string{"SOURCE_CODE"}, Sensitivity: "LOW"}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	if result.Action != "WARN" {
+		t.Errorf("expected WARN, got %s", result.Action)
+	}
+}
+
+func TestEvaluate_ActionLog_FromRule(t *testing.T) {
+	rules := []policy.Rule{
+		{ID: "log-phone", Action: "LOG", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "PHONE"},
+		}},
+	}
+	ctx := policy.EvalContext{EntityTypes: []string{"PHONE"}, Sensitivity: "LOW"}
+	result := policy.Evaluate(rules, ctx, "BLOCK")
+	if result.Action != "LOG" {
+		t.Errorf("expected LOG (from rule), got %s", result.Action)
+	}
+}
+
+// ============================================================
+// FALLBACK SCENARIOS
+// ============================================================
+
+func TestEvaluate_Fallback_NoMatch_ReturnsDefault(t *testing.T) {
+	// Rules exist but none match the context — default action should be returned.
+	rules := []policy.Rule{
+		{ID: "r1", Action: "BLOCK", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "SSN"},
+		}},
+	}
+	// Context has EMAIL, not SSN — no rule matches.
+	ctx := policy.EvalContext{EntityTypes: []string{"EMAIL"}, Sensitivity: "MEDIUM"}
+	result := policy.Evaluate(rules, ctx, "WARN")
+	if result.Action != "WARN" {
+		t.Errorf("expected fallback WARN, got %s", result.Action)
+	}
+	if result.MatchedRule != nil {
+		t.Errorf("expected no matched rule for fallback, got %+v", result.MatchedRule)
+	}
+}
+
+func TestEvaluate_EmptyEntityTypes_NoMatch(t *testing.T) {
+	// EvalContext.EntityTypes is empty — entity_type conditions can't match.
+	rules := []policy.Rule{
+		{ID: "r1", Action: "BLOCK", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "SSN"},
+		}},
+	}
+	ctx := policy.EvalContext{EntityTypes: []string{}, Sensitivity: "CRITICAL"}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	if result.Action != "LOG" {
+		t.Errorf("expected LOG (empty entity types), got %s", result.Action)
+	}
+}
+
+func TestEvaluate_ConfidenceBoundary_Exact(t *testing.T) {
+	// Confidence exactly at threshold — greater_than should NOT match (strict inequality).
+	rules := []policy.Rule{
+		{ID: "r1", Action: "BLOCK", Conditions: []policy.Condition{
+			{Field: "confidence", Operator: "greater_than", Value: 0.95},
+		}},
+	}
+	ctx := policy.EvalContext{MaxConfidence: 0.95}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	// 0.95 is NOT greater than 0.95 — should fall through to default.
+	if result.Action != "LOG" {
+		t.Errorf("expected LOG (confidence not strictly greater), got %s", result.Action)
+	}
+}
+
+func TestEvaluate_ConfidenceBoundary_JustAbove(t *testing.T) {
+	rules := []policy.Rule{
+		{ID: "r1", Action: "BLOCK", Conditions: []policy.Condition{
+			{Field: "confidence", Operator: "greater_than", Value: 0.95},
+		}},
+	}
+	ctx := policy.EvalContext{MaxConfidence: 0.951}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	if result.Action != "BLOCK" {
+		t.Errorf("expected BLOCK (confidence above threshold), got %s", result.Action)
+	}
+}
+
+func TestEvaluate_MultipleRules_FirstMatchWins(t *testing.T) {
+	// Two rules that both match — first in slice wins.
+	rules := []policy.Rule{
+		{ID: "r-redact", Priority: 1, Action: "REDACT", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "EMAIL"},
+		}},
+		{ID: "r-block", Priority: 2, Action: "BLOCK", Conditions: []policy.Condition{
+			{Field: "entity_type", Operator: "equals", Value: "EMAIL"},
+		}},
+	}
+	ctx := policy.EvalContext{EntityTypes: []string{"EMAIL"}}
+	result := policy.Evaluate(rules, ctx, "LOG")
+	if result.Action != "REDACT" {
+		t.Errorf("expected REDACT (first rule wins), got %s", result.Action)
+	}
+	if result.MatchedRule.ID != "r-redact" {
+		t.Errorf("expected r-redact to match, got %s", result.MatchedRule.ID)
+	}
+}
+
+// ============================================================
 // ParseRulesFromDB
 // ============================================================
 

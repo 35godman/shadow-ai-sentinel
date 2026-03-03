@@ -1,0 +1,6 @@
+{
+  "content": "Patient John Smith, SSN 078-05-1120, DOB 1975-03-15, credit card 4532015112830366 exp 12/27, email john.smith@example.com, phone (555) 867-5309. Diagnosis: Type 2 diabetes.",
+  "contentType": "text",
+  "targetDomain": "chat.openai.com",
+  "targetUrl": "https://chat.openai.com/chat"
+}

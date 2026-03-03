@@ -66,9 +66,37 @@ document.addEventListener("paste", async (event: ClipboardEvent) => {
   // Contact background/proxy for the authoritative result + audit logging.
   if (localResult.detections.length === 0 && !pasteWasPrevented) return;
 
+  // Capture paste target before the await so we can remove inserted text if
+  // the proxy confirms BLOCK after local scan allowed the paste through.
+  const pasteTarget = event.target as HTMLElement;
+
   const result = await scanContent(pastedText, "paste");
 
   if (result.action === "BLOCK" || localAction === "BLOCK") {
+    // If the paste wasn't prevented locally, the text is now in the DOM — remove it.
+    if (!pasteWasPrevented) {
+      if (pasteTarget instanceof HTMLTextAreaElement || pasteTarget instanceof HTMLInputElement) {
+        const cur = pasteTarget.selectionStart ?? pasteTarget.value.length;
+        const insertedLen = pastedText.length;
+        pasteTarget.value =
+          pasteTarget.value.substring(0, cur - insertedLen) +
+          pasteTarget.value.substring(cur);
+        pasteTarget.dispatchEvent(new Event("input", { bubbles: true }));
+      } else if (pasteTarget.contentEditable === "true") {
+        // Select the just-pasted content and delete it
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0) {
+          const range = sel.getRangeAt(0);
+          range.setStart(
+            range.endContainer,
+            Math.max(0, (range.endOffset ?? 0) - pastedText.length)
+          );
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand("delete", false);
+        }
+      }
+    }
     showUserNotification(result.userMessage || "Paste blocked: sensitive data detected", "error");
     return;
   }
@@ -140,6 +168,11 @@ document.addEventListener("drop", async (event: DragEvent) => {
   const files = event.dataTransfer?.files;
   if (!files || files.length === 0) return;
 
+  // SYNCHRONOUS: prevent the drop immediately — event.preventDefault() must be
+  // called before any await or the browser will have already processed the drop.
+  event.preventDefault();
+  event.stopImmediatePropagation();
+
   for (const file of Array.from(files)) {
     // Only scan text-based files
     if (!isTextFile(file)) continue;
@@ -150,8 +183,6 @@ document.addEventListener("drop", async (event: DragEvent) => {
     const result = await scanContent(text, "upload");
 
     if (result.action === "BLOCK") {
-      event.preventDefault();
-      event.stopImmediatePropagation();
       showUserNotification(
         `File "${file.name}" blocked: contains ${result.detections.map(d => d.entityType).join(", ")}`,
         "error"
@@ -171,7 +202,7 @@ document.addEventListener("drop", async (event: DragEvent) => {
 // Also monitor file input elements
 document.addEventListener("change", async (event: Event) => {
   const target = event.target as HTMLInputElement;
-  if (target.type !== "file" || !target.files) return;
+  if (!isEnabled || target.type !== "file" || !target.files) return;
 
   for (const file of Array.from(target.files)) {
     if (!isTextFile(file)) continue;
@@ -179,10 +210,20 @@ document.addEventListener("change", async (event: Event) => {
     if (!text) continue;
 
     const result = await scanContent(text, "upload");
+    if (result.action === "BLOCK") {
+      // `change` events on file inputs cannot be preventDefault()-ed after the
+      // fact — clear the value instead to prevent the file from being submitted.
+      target.value = "";
+      showUserNotification(
+        `File "${file.name}" blocked: sensitive data detected`,
+        "error"
+      );
+      return;
+    }
     if (result.detections.length > 0) {
       showUserNotification(
         `File "${file.name}": ${result.detections.length} sensitive item(s) detected`,
-        result.action === "BLOCK" ? "error" : "warning"
+        "warning"
       );
     }
   }
