@@ -290,6 +290,36 @@ describe("Clean text (no false positives)", () => {
   });
 });
 
+describe("Google/Gemini API Key Detection", () => {
+  // Real Google API keys are exactly 39 chars: "AIza" prefix + 35 alphanumeric chars.
+  const validKey1 = "AIzaOhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCL"; // 39 chars
+  const validKey2 = "AIzarZ3aWZkSBvrjn9Wvgfygw2wMqZcUDIh7yfJ"; // 39 chars
+
+  it("detects a valid Google API key (AIza prefix, 39 chars total)", () => {
+    const result = scanText(`GOOGLE_KEY=${validKey1}`);
+    expect(result.detections.some(d => d.entityType === "GCP_KEY")).toBe(true);
+    expect(result.combinedRiskScore).toBe("CRITICAL");
+  });
+
+  it("detects Google API key inline in text", () => {
+    const result = scanText(`Please use this key: ${validKey2} for the Gemini API`);
+    expect(result.detections.some(d => d.entityType === "GCP_KEY")).toBe(true);
+  });
+
+  it("does not flag short AIza prefixed strings (fewer than 35 chars after prefix)", () => {
+    const result = scanText("This is AIzaShort and should not match");
+    const gcpDetections = result.detections.filter(d => d.entityType === "GCP_KEY");
+    expect(gcpDetections).toHaveLength(0);
+  });
+
+  it("does not flag AIza string that is too short (34 chars after prefix, needs 35)", () => {
+    const tooShort = "AIzaSyD8aBcDeFgHiJkLmNoPqRsTuVwXyZ1234"; // 38 total, 34 after AIza
+    const result = scanText(`key=${tooShort}`);
+    const gcpDetections = result.detections.filter(d => d.entityType === "GCP_KEY");
+    expect(gcpDetections).toHaveLength(0);
+  });
+});
+
 describe("Performance", () => {
   it("scans short text in under 5ms", () => {
     const result = scanText("SSN 078-05-1120 and card 4111111111111111");

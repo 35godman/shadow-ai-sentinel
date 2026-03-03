@@ -409,6 +409,41 @@ func TestLuhnCheck(t *testing.T) {
 }
 
 // ============================================================
+// GOOGLE / GEMINI API KEY TESTS
+// ============================================================
+
+// Real Google API keys: "AIza" prefix + exactly 35 alphanumeric chars = 39 total.
+const googleAPIKey1 = "AIzaOhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCL" // 39 chars
+const googleAPIKey2 = "AIzarZ3aWZkSBvrjn9Wvgfygw2wMqZcUDIh7yfJ" // 39 chars
+
+func TestGoogleAPIKey_Detected(t *testing.T) {
+	result := scanner.ScanText("GOOGLE_KEY="+googleAPIKey1, nil)
+
+	assertHasEntityType(t, result.Detections, "GCP_KEY")
+	assertRisk(t, result, "CRITICAL")
+}
+
+func TestGoogleAPIKey_InlineText_Detected(t *testing.T) {
+	result := scanner.ScanText("Use "+googleAPIKey2+" to authenticate with the Gemini API", nil)
+
+	assertHasEntityType(t, result.Detections, "GCP_KEY")
+}
+
+func TestGoogleAPIKey_TooShort_NotDetected(t *testing.T) {
+	// "AIzaShort" is fewer than 35 chars after the prefix — should not match
+	result := scanner.ScanText("key=AIzaShort", nil)
+
+	assertNoEntityType(t, result.Detections, "GCP_KEY")
+}
+
+func TestGoogleAPIKey_34CharsAfterPrefix_NotDetected(t *testing.T) {
+	// 34 chars after prefix (38 total) — one short of required 35
+	result := scanner.ScanText("key=AIzaSyD8aBcDeFgHiJkLmNoPqRsTuVwXyZ1234", nil)
+
+	assertNoEntityType(t, result.Detections, "GCP_KEY")
+}
+
+// ============================================================
 // HELPERS
 // ============================================================
 

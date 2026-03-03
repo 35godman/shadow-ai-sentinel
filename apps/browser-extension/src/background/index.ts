@@ -28,17 +28,30 @@ const FLUSH_INTERVAL_MS = 10000;
 // INITIALIZATION
 // ============================================================
 
-chrome.runtime.onInstalled.addListener(async () => {
-  console.log("[Sentinel] Extension installed. Loading config...");
-  await loadConfig();
-  startEventFlush();
-  startConfigPolling();
+// MV3 service workers are terminated after a few seconds of inactivity and
+// restarted on demand. Neither onInstalled nor onStartup fires on restart —
+// only top-level code runs. Register the alarm listener synchronously here so
+// it is always active regardless of how the service worker was woken up.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "flush-events") flushEvents();
+  if (alarm.name === "poll-config") pollConfig();
 });
 
-chrome.runtime.onStartup.addListener(async () => {
+// Auto-initialize on every service worker start (covers restarts after termination).
+(async function initialize() {
   await loadConfig();
   startEventFlush();
   startConfigPolling();
+})();
+
+chrome.runtime.onInstalled.addListener(() => {
+  console.log("[Sentinel] Extension installed/updated.");
+  // loadConfig/startEventFlush/startConfigPolling already called by initialize() above.
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  // Service worker restarts on browser startup; initialize() at top level handles this.
+  console.log("[Sentinel] Browser startup.");
 });
 
 async function loadConfig() {
@@ -112,6 +125,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // ============================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Guard against null/malformed messages (can occur during context invalidation).
+  if (!message || typeof message.type !== "string") return false;
+
   if (message.type === "SCAN_CONTENT") {
     handleScanRequest(message, sender).then(sendResponse);
     return true; // Indicates async response
@@ -124,9 +140,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "UPDATE_CONFIG") {
     config = { ...config, ...message.config };
-    saveConfig();
-    sendResponse({ success: true });
-    return false;
+    // Await the async save before responding so the caller knows persistence succeeded.
+    saveConfig()
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true; // Keep message channel open for async response
   }
 
   if (message.type === "GET_RECENT_EVENTS") {
@@ -290,10 +308,9 @@ async function getRecentEvents(): Promise<AuditEvent[]> {
 // ============================================================
 
 function startEventFlush() {
-  chrome.alarms.create("flush-events", { periodInMinutes: FLUSH_INTERVAL_MS / 60000 });
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === "flush-events") flushEvents();
-    if (alarm.name === "poll-config") pollConfig();
+  // Clear before creating to prevent duplicate alarms if called more than once.
+  chrome.alarms.clear("flush-events", () => {
+    chrome.alarms.create("flush-events", { periodInMinutes: FLUSH_INTERVAL_MS / 60000 });
   });
 }
 
@@ -328,7 +345,9 @@ async function flushEvents() {
 // ============================================================
 
 function startConfigPolling() {
-  chrome.alarms.create("poll-config", { periodInMinutes: config.pollingIntervalMs / 60000 });
+  chrome.alarms.clear("poll-config", () => {
+    chrome.alarms.create("poll-config", { periodInMinutes: config.pollingIntervalMs / 60000 });
+  });
 }
 
 async function pollConfig() {

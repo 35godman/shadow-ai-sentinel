@@ -226,6 +226,16 @@ export const PATTERNS: RegexPattern[] = [
     complianceFrameworks: ["SOC2", "CIS"],
     description: "GCP service account JSON key file content",
   },
+  {
+    id: "google-api-key",
+    entityType: "GCP_KEY",
+    name: "Google/Gemini API Key",
+    pattern: /\b(AIza[A-Za-z0-9\-_]{35})\b/g,
+    validator: (m) => shannonEntropy(m) > 3.5,
+    sensitivityLevel: "CRITICAL",
+    complianceFrameworks: ["SOC2"],
+    description: "Google API key (AIza prefix — Gemini, Maps, Vision, Translate, etc.)",
+  },
 
   // --- Email Addresses ---
   {
